@@ -43,6 +43,10 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+validation_outputs/
+outputs/
+misc/
+.DS_Store
 nosetests.xml
 coverage.xml
 *.cover
@@ -183,6 +187,13 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Model weights (large binaries — never commit to the repo)
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+
 # PyPI configuration file
 .pypirc
 
@@ -192,3 +203,4 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+.claude

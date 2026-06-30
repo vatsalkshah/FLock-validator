@@ -15,13 +15,13 @@ class FedLedger:
 
     def _get(self, endpoint: str):
         url = f"{self.url}{endpoint}"
-        response = requests.get(url, headers=self.headers)
+        response = requests.get(url, headers=self.headers, timeout=30)
         response.raise_for_status()
         return response.json()
 
     def _post(self, endpoint: str, json: Optional[dict] = None):
         url = f"{self.url}{endpoint}"
-        return requests.post(url, headers=self.headers, json=json)
+        return requests.post(url, headers=self.headers, json=json, timeout=30)
 
     def list_tasks(self):
         endpoint = "/tasks/list"

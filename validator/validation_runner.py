@@ -7,6 +7,9 @@ from .api import FedLedger
 from .config import load_config_for_task
 from .modules.base import BaseValidationModule, BaseConfig, BaseInputData, BaseMetrics
 
+_RETRY_SLEEP = 60   # seconds to back off after unexpected errors in the main loop
+
+
 class ValidationRunner:
     """
     Runs the validation process for a given module and set of task IDs.
@@ -22,17 +25,6 @@ class ValidationRunner:
         assignment_lookup_interval: int = 180,
         debug: bool = False,
     ):
-        """
-        Initialize the ValidationRunner.
-        Args:
-            module: The name of the validation module to use.
-            task_ids: List of task IDs to validate.
-            flock_api_key: API key for Flock.
-            hf_token: HuggingFace token (passed for compatibility, not used here).
-            time_sleep: Time to sleep between retries (seconds).
-            assignment_lookup_interval: Assignment lookup interval (seconds).
-            debug: Enable debug mode (currently unused).
-        """
         self.module = module
         self.task_ids = task_ids
         self.flock_api_key = flock_api_key
@@ -52,7 +44,6 @@ class ValidationRunner:
             raise ValueError(f"Module {self.module} is not valid for the given task ids. Check task types: {task_types}")
         module_mod = importlib.import_module(f"validator.modules.{self.module}")
         module_cls: type[BaseValidationModule] = module_mod.MODULE
-        # Map config to module instance, and task_id to module instance
         self.module_config_to_module: dict[BaseConfig, BaseValidationModule] = {}
         self.task_id_to_module: dict[str, BaseValidationModule] = {}
         for task_id in self.task_ids:
@@ -60,80 +51,116 @@ class ValidationRunner:
             self.module_config_to_module.setdefault(config, module_cls(config=config))
             self.task_id_to_module[task_id] = self.module_config_to_module[config]
 
-    def perform_validation(self, assignment_id: str, task_id: str,input_data: BaseInputData) -> BaseMetrics | None:
+    def perform_validation(self, assignment_id: str, task_id: str, input_data: BaseInputData) -> BaseMetrics | None:
         """
         Perform validation for a given assignment and input data.
+        Retries up to 3 times on transient failures.  Returns None and marks the
+        assignment failed if all retries are exhausted.
         """
         module_obj = self.task_id_to_module[task_id]
+        last_error: Exception | None = None
         for attempt in range(3):
             try:
                 return module_obj.validate(input_data)
             except KeyboardInterrupt:
-                sys.exit(1)
+                raise
             except RecoverableException as e:
-                logger.error(f"Recoverable exception: {e}")
-                sys.exit(1)
-            except (RuntimeError, ValueError) as e:
-                logger.error(e)
-                self.api.mark_assignment_as_failed(assignment_id)
-                sys.exit(1)
+                # Infra-side issue (bad config, env problem) — not the miner's fault.
+                # Log and return None without marking the assignment as failed; the
+                # assignment will time out and be re-queued by FedLedger.
+                logger.error(f"Recoverable infra exception (assignment {assignment_id}): {e}")
+                return None
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed: {e}")
-                if attempt == 2:
-                    logger.error(f"Marking assignment {assignment_id} as failed after 3 attempts")
-                    self.api.mark_assignment_as_failed(assignment_id)
-                    return None
+                last_error = e
+                logger.error(f"Validation attempt {attempt + 1}/3 failed for {assignment_id}: {e}")
+        logger.error(f"Marking assignment {assignment_id} as failed after 3 attempts: {last_error}")
+        try:
+            self.api.mark_assignment_as_failed(assignment_id)
+        except Exception as e:
+            logger.error(f"Could not mark assignment {assignment_id} as failed: {e}")
+        return None
+
+    def _request_assignment(self, task_id: str):
+        """Poll for an assignment, blocking until one is available or interrupted."""
+        last_successful_request_time = time.time()
+        while True:
+            try:
+                resp = self.api.request_validation_assignment(task_id)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                logger.error(f"Network error fetching assignment for task {task_id}: {e}")
+                logger.info(f"Retrying in {self.time_sleep}s")
+                time.sleep(self.time_sleep)
+                continue
+
+            if resp.status_code == 200:
+                return resp
+
+            try:
+                resp_json = resp.json()
+            except Exception:
+                resp_json = None
+
+            if resp_json == {"detail": "No task submissions available to validate"}:
+                logger.info("No task submissions available to validate")
+                time.sleep(self.assignment_lookup_interval)
+            elif resp_json == {"detail": "Rate limit reached for validation assignment lookup: 1 per 3 minutes"}:
+                time_since_last_success = time.time() - last_successful_request_time
+                wait = max(0, self.assignment_lookup_interval - time_since_last_success)
+                if wait > 0:
+                    logger.info(f"Rate limited — sleeping {int(wait)}s")
+                    time.sleep(wait)
+            else:
+                logger.error(f"Unexpected response fetching assignment: {resp.status_code} {resp.content}")
+                time.sleep(self.time_sleep)
+
+    def _submit_result(self, assignment_id: str, metrics: BaseMetrics) -> None:
+        """Submit validation result; logs on failure but never raises."""
+        try:
+            resp = self.api.submit_validation_result(
+                assignment_id=assignment_id,
+                data=metrics.model_dump(),
+            )
+            if resp.status_code == 200:
+                logger.info(f"Validation result submitted successfully for assignment {assignment_id}")
+            else:
+                logger.error(
+                    f"Failed to submit result for {assignment_id}: "
+                    f"HTTP {resp.status_code} {resp.content}"
+                )
+        except Exception as e:
+            logger.error(f"Network error submitting result for {assignment_id}: {e}")
 
     def run(self):
         """
         Run the validation loop for all configured task IDs.
-        This method blocks and runs indefinitely.
+        This method blocks and runs indefinitely.  Unexpected exceptions within a
+        single iteration are caught and logged so the loop never exits unintentionally.
         """
-        last_successful_request_time = {task_id: time.time() for task_id in self.task_ids}
         while True:
             for task_id in self.task_ids:
-                resp = None
-                # Try to get a valid assignment
-                while True:
-                    resp = self.api.request_validation_assignment(task_id)
-                    if resp.status_code == 200:
-                        last_successful_request_time[task_id] = time.time()
-                        break
-                    else:
-                        # Try to parse JSON response, handle empty or invalid responses
-                        try:
-                            resp_json = resp.json()
-                        except Exception:
-                            resp_json = None
-                        
-                        if resp_json == {"detail": "No task submissions available to validate"}:
-                            logger.info("Failed to ask assignment_id: No task submissions available to validate")
-                        elif resp_json == {"detail": "Rate limit reached for validation assignment lookup: 1 per 3 minutes"}:
-                            time_since_last_success = time.time() - last_successful_request_time[task_id]
-                            if time_since_last_success < self.assignment_lookup_interval:
-                                time_to_sleep = self.assignment_lookup_interval - time_since_last_success
-                                logger.info(f"Sleeping for {int(time_to_sleep)} seconds")
-                                time.sleep(time_to_sleep)
-                            continue
-                        else:
-                            logger.error(f"Failed to get assignment: {resp.content}")
-                            logger.info(f"Sleeping for {int(self.time_sleep)} seconds")
-                            time.sleep(self.time_sleep)
-                            continue
-                module_obj = self.task_id_to_module[task_id]
-                task_submission_data = resp.json()["task_submission"]["data"]
-                validation_assignment_data = resp.json()["data"]
-                merged_data = {**task_submission_data, **validation_assignment_data}
-                input_data = module_obj.input_data_schema.model_validate(merged_data)
-                assignment_id = resp.json()["id"]
-                metrics = self.perform_validation(assignment_id, task_id, input_data)
-                if metrics is None:
-                    continue
-                resp_submit = self.api.submit_validation_result(
-                    assignment_id=assignment_id,
-                    data=metrics.model_dump(),
-                )
-                # if successful, log
-                if resp_submit.status_code == 200:
-                    logger.info(f"Validation result submitted successfully for assignment {assignment_id}")
-                resp_submit.raise_for_status()
+                try:
+                    resp = self._request_assignment(task_id)
+
+                    resp_json = resp.json()
+                    task_submission_data = resp_json["task_submission"]["data"]
+                    validation_assignment_data = resp_json["data"]
+                    merged_data = {**task_submission_data, **validation_assignment_data}
+                    assignment_id = resp_json["id"]
+
+                    module_obj = self.task_id_to_module[task_id]
+                    input_data = module_obj.input_data_schema.model_validate(merged_data)
+
+                    metrics = self.perform_validation(assignment_id, task_id, input_data)
+                    if metrics is not None:
+                        self._submit_result(assignment_id, metrics)
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected error in validation loop for task {task_id}: {e}. "
+                        f"Sleeping {_RETRY_SLEEP}s before retrying."
+                    )
+                    time.sleep(_RETRY_SLEEP)

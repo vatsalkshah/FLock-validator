@@ -10,7 +10,7 @@ The project is split into two layers:
 
 ## Setup
 
-1. Install miniconda (e.g. [miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install))
+1. Install miniconda (recommended, e.g. [miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install)). If `conda` is not available, the runner falls back to a local Python 3.10/3.11 venv.
 2. Install dependencies:
 
 ```bash
@@ -21,7 +21,7 @@ pip install -r requirements.txt
 
 ### Running Validation Jobs
 
-Use the CLI to start the validation process. The CLI settings are defined in `validator/entrypoint.py`.
+Use the CLI to start the validation process. The CLI settings are defined in `environment_entrypoint.py`.
 
 ```bash
 python run.py \
@@ -45,6 +45,14 @@ python run.py \
 ```bash
 python run.py lora --task_ids 123,456 --flock-api-key $FLOCK_API_KEY --hf-token $HF_TOKEN
 ```
+
+#### Robotics VLA
+
+```bash
+python run.py robotics_vla --task_ids "$ROBOTICS_TASK_ID" --flock-api-key "$FLOCK_API_KEY" --hf-token "$HF_TOKEN"
+```
+
+Dependencies (MuJoCo, Robosuite, Torch, Hugging Face) are installed automatically on first run. For full setup instructions, scoring details, submission contract, and a troubleshooting FAQ see [`validator/modules/robotics_vla/README.md`](validator/modules/robotics_vla/README.md).
 
 ### Environment Variables
 You can set the following environment variables instead of passing them as CLI options:

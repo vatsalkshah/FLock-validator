@@ -1,0 +1,21 @@
+name: robotics_vla
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.12
+  - pip
+  - numpy
+  - pillow
+  - imageio
+  - imageio-ffmpeg
+  - pip:
+    - accelerate
+    - huggingface-hub
+    - mujoco==3.9.0
+    - peft
+    - robosuite==1.5.2
+    - safetensors
+    - torch
+    - torchvision
+    - transformers
