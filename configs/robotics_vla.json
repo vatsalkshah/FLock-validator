@@ -15,5 +15,9 @@
   "max_videos": 2,
   "device": "cuda",
   "torch_dtype": "bfloat16",
-  "package_cache_dir": ".cache/robotics_vla/package_cache"
+  "package_cache_dir": ".cache/robotics_vla/package_cache",
+  "policy_load_timeout_seconds": 600,
+  "policy_action_timeout_seconds": 30,
+  "policy_memory_limit_gb": 64,
+  "policy_cpu_time_seconds": 3600
 }

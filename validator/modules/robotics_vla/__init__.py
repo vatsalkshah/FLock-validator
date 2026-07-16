@@ -48,6 +48,10 @@ class RoboticsVLAConfig(BaseConfig):
     max_episode_horizon: int = 300
     expose_raw_obs: bool = False
     package_cache_dir: str = DEFAULT_PACKAGE_CACHE_DIR
+    policy_load_timeout_seconds: float = Field(default=600.0, gt=0)
+    policy_action_timeout_seconds: float = Field(default=30.0, gt=0)
+    policy_memory_limit_gb: int = Field(default=64, ge=1)
+    policy_cpu_time_seconds: int = Field(default=3600, ge=1)
 
 
 class RoboticsVLAMetrics(BaseMetrics):
@@ -99,7 +103,9 @@ class RoboticsVLAValidationModule(BaseValidationModule):
                     failure_mode="parameter_limit_exceeded",
                 )
 
-            resolved_data = resolve_validation_data_package(data, self.config.package_cache_dir)
+            resolved_data = resolve_validation_data_package(
+                data, self.config.package_cache_dir
+            )
             manifest = resolved_data.manifest
             if manifest.suite_version != self.config.suite_version:
                 # A package/config mismatch is an operator-side (infra) problem, not
@@ -107,6 +113,7 @@ class RoboticsVLAValidationModule(BaseValidationModule):
                 # lets the assignment time out and be re-queued rather than zeroing
                 # the miner's score.
                 from validator.exceptions import RecoverableException
+
                 raise RecoverableException(
                     f"Manifest suite_version {manifest.suite_version!r} does not match "
                     f"config suite_version {self.config.suite_version!r}"
@@ -117,37 +124,46 @@ class RoboticsVLAValidationModule(BaseValidationModule):
                 adapter_filename=data.adapter_filename,
                 device=self.config.device,
                 torch_dtype=self.config.torch_dtype,
+                load_timeout_seconds=self.config.policy_load_timeout_seconds,
+                action_timeout_seconds=self.config.policy_action_timeout_seconds,
+                memory_limit_bytes=self.config.policy_memory_limit_gb * 1024**3,
+                cpu_time_seconds=self.config.policy_cpu_time_seconds,
             )
+            try:
+                # Re-check the cap against the policy graph audited inside the
+                # sandbox. Unknown/opaque graphs are rejected even when repo files
+                # happen to report a small count.
+                parameter_count = enforce_parameter_limit(
+                    parameter_count, count_policy_parameters(policy), data.max_params
+                )
 
-            # Re-check the cap against the loaded policy to catch submissions that
-            # ship tiny repo weights but pull a large base model in at load time.
-            parameter_count = enforce_parameter_limit(
-                parameter_count, count_policy_parameters(policy), data.max_params
-            )
+                episodes = manifest.episodes
+                if self.config.max_episodes is not None:
+                    episodes = episodes[: self.config.max_episodes]
 
-            episodes = manifest.episodes
-            if self.config.max_episodes is not None:
-                episodes = episodes[: self.config.max_episodes]
-
-            settings = RolloutSettings(
-                seed=self.config.seed,
-                suite_version=self.config.suite_version,
-                robot=self.config.robot,
-                controller=self.config.controller,
-                horizon=self.config.horizon,
-                max_episode_horizon=self.config.max_episode_horizon,
-                control_freq=self.config.control_freq,
-                camera_name=self.config.camera_name,
-                camera_height=self.config.camera_height,
-                camera_width=self.config.camera_width,
-                action_dim=self.config.action_dim,
-                render_video=self.config.render_video,
-                video_dir=self.config.video_dir,
-                max_videos=self.config.max_videos,
-                expose_raw_obs=self.config.expose_raw_obs,
-                task_registry=resolved_data.task_registry,
-            )
-            result = rollout_manifest(policy=policy, episodes=episodes, settings=settings)
+                settings = RolloutSettings(
+                    seed=self.config.seed,
+                    suite_version=self.config.suite_version,
+                    robot=self.config.robot,
+                    controller=self.config.controller,
+                    horizon=self.config.horizon,
+                    max_episode_horizon=self.config.max_episode_horizon,
+                    control_freq=self.config.control_freq,
+                    camera_name=self.config.camera_name,
+                    camera_height=self.config.camera_height,
+                    camera_width=self.config.camera_width,
+                    action_dim=self.config.action_dim,
+                    render_video=self.config.render_video,
+                    video_dir=self.config.video_dir,
+                    max_videos=self.config.max_videos,
+                    expose_raw_obs=self.config.expose_raw_obs,
+                    task_registry=resolved_data.task_registry,
+                )
+                result = rollout_manifest(
+                    policy=policy, episodes=episodes, settings=settings
+                )
+            finally:
+                policy.close()
             return RoboticsVLAMetrics(
                 score=result.weighted_episode_score,
                 loss=result.loss,

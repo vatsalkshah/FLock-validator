@@ -1,16 +1,24 @@
 import json
+import sys
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from huggingface_hub import errors as hf_errors
 
 from validator.modules.robotics_vla.adapter import (
     count_policy_parameters,
     enforce_parameter_limit,
     load_policy_from_adapter,
+    resolve_model_dir,
 )
-from validator.modules.robotics_vla import RoboticsVLAValidationModule
+from validator.modules.robotics_vla import (
+    RoboticsVLAConfig,
+    RoboticsVLAInputData,
+    RoboticsVLAValidationModule,
+)
 from validator.modules.robotics_vla.errors import RoboticsSubmissionError
 from validator.modules.robotics_vla.data_package import (
     resolve_validation_data_package,
@@ -23,7 +31,6 @@ from validator.modules.robotics_vla.domain_randomization import (
 from validator.modules.robotics_vla.manifest import EpisodeSpec, ValidationManifest
 from validator.modules.robotics_vla.manifest import load_manifest
 from validator.modules.robotics_vla.simulation import (
-    SUPPORTED_TASKS,
     RolloutSettings,
     adapt_action_for_env,
     compute_episode_score,
@@ -106,7 +113,11 @@ def test_hybrid_strict_scoring_caps_failed_partial_credit():
 
 def test_difficulty_weights_are_simple_and_monotonic():
     weights = [
-        difficulty_weight(EpisodeSpec(task="lift_cube", instruction="x", seed=1, difficulty=difficulty))
+        difficulty_weight(
+            EpisodeSpec(
+                task="lift_cube", instruction="x", seed=1, difficulty=difficulty
+            )
+        )
         for difficulty in ["low", "medium", "hard", "very_high"]
     ]
 
@@ -176,7 +187,15 @@ def test_prepare_policy_obs_hides_raw_state_by_default():
 
     obs = prepare_policy_obs(raw_obs, episode, settings, step_idx=3)
 
-    assert set(obs) == {"image", "instruction", "proprio", "task", "step", "difficulty", "horizon"}
+    assert set(obs) == {
+        "image",
+        "instruction",
+        "proprio",
+        "task",
+        "step",
+        "difficulty",
+        "horizon",
+    }
     assert obs["proprio"].shape == (25,)
     assert obs["difficulty"] is None
     assert obs["horizon"] == 320
@@ -268,7 +287,9 @@ def test_domain_randomization_is_deterministic_and_manifest_level():
                 "camera_weights": {"frontview": 1.0},
                 "horizon_jitter": {"min": 7, "max": 7},
                 "seed_offset_range": {"min": 1000, "max": 1000},
-                "instruction_prefixes": ["Held-out visual variant: {instruction_lower}"],
+                "instruction_prefixes": [
+                    "Held-out visual variant: {instruction_lower}"
+                ],
                 "tags": ["heldout_visual_variant"],
                 "modifiers": {"bin_texture": "matte_private_eval"},
             }
@@ -279,7 +300,11 @@ def test_domain_randomization_is_deterministic_and_manifest_level():
     second = apply_domain_randomization_to_manifest(manifest, spec)
 
     assert first.model_dump() == second.model_dump()
-    randomized = [episode for episode in first.episodes if episode.task in {"pick_place_can", "pick_place_milk"}]
+    randomized = [
+        episode
+        for episode in first.episodes
+        if episode.task in {"pick_place_can", "pick_place_milk"}
+    ]
     assert randomized
     for original, episode in zip(manifest.episodes, first.episodes):
         if episode.task in {"pick_place_can", "pick_place_milk"}:
@@ -288,7 +313,10 @@ def test_domain_randomization_is_deterministic_and_manifest_level():
             assert episode.seed == original.seed + 1000
             assert episode.instruction.startswith("Held-out visual variant:")
             assert "heldout_visual_variant" in episode.tags
-            assert episode.domain_randomization["modifiers"]["bin_texture"] == "matte_private_eval"
+            assert (
+                episode.domain_randomization["modifiers"]["bin_texture"]
+                == "matte_private_eval"
+            )
 
 
 def test_validation_zip_package_applies_domain_randomization(tmp_path: Path):
@@ -330,7 +358,9 @@ def test_validation_zip_package_applies_domain_randomization(tmp_path: Path):
             }
         )
     )
-    write_validation_package(manifest_path, output_zip, randomization_path, metadata={"split": "public_eval"})
+    write_validation_package(
+        manifest_path, output_zip, randomization_path, metadata={"split": "public_eval"}
+    )
 
     class Input:
         validation_data_url = str(output_zip)
@@ -389,7 +419,9 @@ def test_validation_zip_package_loads_allowlisted_task_registry(tmp_path: Path):
             }
         )
     )
-    write_validation_package(manifest_path, output_zip, task_registry_path=registry_path)
+    write_validation_package(
+        manifest_path, output_zip, task_registry_path=registry_path
+    )
 
     class Input:
         validation_data_url = str(output_zip)
@@ -593,9 +625,109 @@ def load_policy(model_dir, device, dtype):
 """
     )
 
-    policy = load_policy_from_adapter(tmp_path, "flock_robotics_adapter.py", "cpu", "float32")
+    policy = load_policy_from_adapter(
+        tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+    )
 
     assert policy.act({}).shape == (7,)
+
+
+def test_adapter_worker_does_not_receive_validator_secrets(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FLOCK_API_KEY", "must-not-cross-process-boundary")
+    monkeypatch.setenv("HF_TOKEN", "must-not-cross-process-boundary")
+    (tmp_path / "flock_robotics_adapter.py").write_text(
+        """
+import os
+import numpy as np
+
+class Policy:
+    def act(self, obs):
+        return np.zeros(7, dtype=np.float32)
+
+def load_policy(model_dir, device, dtype):
+    if os.getenv("FLOCK_API_KEY") or os.getenv("HF_TOKEN"):
+        raise RuntimeError("validator secret leaked into adapter worker")
+    return Policy()
+"""
+    )
+
+    policy = load_policy_from_adapter(
+        tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+    )
+    try:
+        assert policy.act({}).shape == (7,)
+    finally:
+        policy.close()
+
+
+def test_adapter_worker_enforces_action_wall_timeout(tmp_path: Path):
+    (tmp_path / "flock_robotics_adapter.py").write_text(
+        """
+class Policy:
+    def act(self, obs):
+        while True:
+            pass
+
+def load_policy(model_dir, device, dtype):
+    return Policy()
+"""
+    )
+
+    policy = load_policy_from_adapter(
+        tmp_path,
+        "flock_robotics_adapter.py",
+        "cpu",
+        "float32",
+        action_timeout_seconds=0.1,
+    )
+    with pytest.raises(RoboticsSubmissionError) as excinfo:
+        policy.act({})
+    assert excinfo.value.failure_mode == "policy_timeout"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux seccomp behavior")
+def test_adapter_worker_denies_network_filesystem_and_process_escape(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    secret_path = tmp_path / "validator-secret.txt"
+    secret_path.write_text("must-not-be-readable")
+    (model_dir / "flock_robotics_adapter.py").write_text(
+        f"""
+import socket
+import subprocess
+import numpy as np
+
+class Policy:
+    def act(self, obs):
+        return np.zeros(7, dtype=np.float32)
+
+def load_policy(model_dir, device, dtype):
+    denied = 0
+    try:
+        socket.socket()
+    except OSError:
+        denied += 1
+    try:
+        open({str(secret_path)!r}).read()
+    except OSError:
+        denied += 1
+    try:
+        subprocess.run(["/bin/true"], check=True)
+    except OSError:
+        denied += 1
+    if denied == 3:
+        return Policy()
+    raise RuntimeError("one or more sandbox boundaries were not enforced")
+"""
+    )
+
+    policy = load_policy_from_adapter(
+        model_dir, "flock_robotics_adapter.py", "cpu", "float32"
+    )
+    try:
+        assert policy.act({}).shape == (7,)
+    finally:
+        policy.close()
 
 
 # --- Issue 1: bad submissions are scored, never crash the validator ----------
@@ -619,7 +751,9 @@ def test_adapter_loads_through_hf_style_symlink(tmp_path: Path):
     snapshot.mkdir(parents=True)
     (snapshot / "flock_robotics_adapter.py").symlink_to(blob)
 
-    policy = load_policy_from_adapter(snapshot, "flock_robotics_adapter.py", "cpu", "float32")
+    policy = load_policy_from_adapter(
+        snapshot, "flock_robotics_adapter.py", "cpu", "float32"
+    )
 
     assert policy.act({}).shape == (7,)
 
@@ -631,20 +765,26 @@ def test_adapter_filename_escape_is_rejected(tmp_path: Path):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     with pytest.raises(RoboticsSubmissionError) as excinfo:
-        load_policy_from_adapter(model_dir, "../flock_robotics_adapter.py", "cpu", "float32")
+        load_policy_from_adapter(
+            model_dir, "../flock_robotics_adapter.py", "cpu", "float32"
+        )
     assert excinfo.value.failure_mode == "adapter_contract"
 
 
 def test_missing_adapter_is_submission_error(tmp_path: Path):
     with pytest.raises(RoboticsSubmissionError) as excinfo:
-        load_policy_from_adapter(tmp_path, "flock_robotics_adapter.py", "cpu", "float32")
+        load_policy_from_adapter(
+            tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+        )
     assert excinfo.value.failure_mode == "adapter_missing"
 
 
 def test_adapter_without_load_policy_is_contract_error(tmp_path: Path):
     (tmp_path / "flock_robotics_adapter.py").write_text("X = 1\n")
     with pytest.raises(RoboticsSubmissionError) as excinfo:
-        load_policy_from_adapter(tmp_path, "flock_robotics_adapter.py", "cpu", "float32")
+        load_policy_from_adapter(
+            tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+        )
     assert excinfo.value.failure_mode == "adapter_contract"
 
 
@@ -653,29 +793,42 @@ def test_policy_without_act_is_contract_error(tmp_path: Path):
         "def load_policy(model_dir, device, dtype):\n    return object()\n"
     )
     with pytest.raises(RoboticsSubmissionError) as excinfo:
-        load_policy_from_adapter(tmp_path, "flock_robotics_adapter.py", "cpu", "float32")
+        load_policy_from_adapter(
+            tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+        )
     assert excinfo.value.failure_mode == "adapter_contract"
 
 
-def test_failing_load_policy_is_retried_then_caught(tmp_path: Path):
+def test_failing_load_policy_is_retried_then_succeeds(tmp_path: Path):
     from validator.modules.robotics_vla.adapter import MODEL_QUERY_RETRIES
 
-    counter = tmp_path / "load_attempts.txt"
-    counter.write_text("0")
     (tmp_path / "flock_robotics_adapter.py").write_text(
-        """
-from pathlib import Path
+        f"""
+import numpy as np
+
+attempts = 0
+
+class Policy:
+    def act(self, obs):
+        result = np.zeros(7, dtype=np.float32)
+        result[0] = attempts
+        return result
 
 def load_policy(model_dir, device, dtype):
-    counter = Path(model_dir) / "load_attempts.txt"
-    counter.write_text(str(int(counter.read_text()) + 1))
-    raise RuntimeError("model would not load")
+    global attempts
+    attempts += 1
+    if attempts <= {MODEL_QUERY_RETRIES}:
+        raise RuntimeError("transient model load failure")
+    return Policy()
 """
     )
-    with pytest.raises(RoboticsSubmissionError) as excinfo:
-        load_policy_from_adapter(tmp_path, "flock_robotics_adapter.py", "cpu", "float32")
-    assert excinfo.value.failure_mode == "model_load_failed"
-    assert int(counter.read_text()) == 1 + MODEL_QUERY_RETRIES
+    policy = load_policy_from_adapter(
+        tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+    )
+    try:
+        assert policy.act({})[0] == 1 + MODEL_QUERY_RETRIES
+    finally:
+        policy.close()
 
 
 def test_query_policy_action_retries_then_reports_invalid_action():
@@ -751,7 +904,9 @@ def test_runner_does_not_crash_on_bad_submission():
     runner.api = FakeApi()
 
     real_exit = _sys.exit
-    _sys.exit = lambda *a: (_ for _ in ()).throw(AssertionError("runner called sys.exit"))
+    _sys.exit = lambda *a: (_ for _ in ()).throw(
+        AssertionError("runner called sys.exit")
+    )
     try:
         result = runner.perform_validation("assignment-1", "task-1", object())
     finally:
@@ -780,7 +935,12 @@ def test_enforce_parameter_limit_rejects_oversized_policy():
 
 def test_enforce_parameter_limit_returns_best_known_count():
     assert enforce_parameter_limit(1_000, 350_000, 4_500_000_000) == 350_000
-    assert enforce_parameter_limit(420_000, None, 4_500_000_000) == 420_000
+
+
+def test_enforce_parameter_limit_rejects_unaccounted_policy_even_with_repo_count():
+    with pytest.raises(RoboticsSubmissionError) as excinfo:
+        enforce_parameter_limit(420_000, None, 4_500_000_000)
+    assert excinfo.value.failure_mode == "parameter_count_unknown"
 
 
 def test_count_policy_parameters_handles_non_torch_policy():
@@ -788,5 +948,154 @@ def test_count_policy_parameters_handles_non_torch_policy():
         def act(self, obs):
             return None
 
-    # A policy with no torch modules cannot be counted -> None (not a crash).
+    # An inspectable policy with no tensor state has an auditable zero count.
+    assert count_policy_parameters(Policy()) == 0
+
+
+def test_count_policy_parameters_recurses_into_nested_containers_and_cycles(
+    monkeypatch,
+):
+    class FakeTensor:
+        def __init__(self, size):
+            self._size = size
+
+        def numel(self):
+            return self._size
+
+    class FakeModule:
+        pass
+
+    class FakeLinear(FakeModule):
+        def __init__(self):
+            self.weight = FakeTensor(6)
+            self.bias = FakeTensor(2)
+
+    fake_torch = SimpleNamespace(
+        Tensor=FakeTensor,
+        nn=SimpleNamespace(Module=FakeModule),
+        device=type("FakeDevice", (), {}),
+        dtype=type("FakeDtype", (), {}),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    class Policy:
+        def __init__(self):
+            nested = []
+            nested.append(nested)
+            nested.append({"model": FakeLinear()})
+            self.payload = nested
+
+        def act(self, obs):
+            return np.zeros(7, dtype=np.float32)
+
+    # Linear(3, 2) has 6 weights and 2 bias parameters.
+    assert count_policy_parameters(Policy()) == 8
+
+
+def test_count_policy_parameters_rejects_opaque_policy_state():
+    class Opaque:
+        __slots__ = ()
+
+    class Policy:
+        def __init__(self):
+            self.audited_parameter_count = 0  # Miner self-attestation is not trusted.
+            self.hidden = Opaque()
+
+        def act(self, obs):
+            return None
+
     assert count_policy_parameters(Policy()) is None
+
+
+def test_count_policy_parameters_counts_class_level_model():
+    # A miner cannot bypass the cap by stashing the model as a class attribute
+    # instead of an instance attribute.
+    big = np.zeros(10_000_000, dtype=np.float32)
+
+    class ClassAttrPolicy:
+        weights = {"w": big}
+
+        def act(self, obs):
+            return type(self).weights["w"][:7]
+
+    assert count_policy_parameters(ClassAttrPolicy()) == 10_000_000
+
+
+def test_count_policy_parameters_counts_property_hidden_model():
+    # Nor by hiding the model behind a property getter.
+    big = np.zeros(10_000_000, dtype=np.float32)
+
+    class PropertyPolicy:
+        @property
+        def weights(self):
+            return big
+
+        def act(self, obs):
+            return self.weights[:7]
+
+    assert count_policy_parameters(PropertyPolicy()) == 10_000_000
+
+
+def test_invalid_hub_reference_is_classified_as_submission_error(monkeypatch):
+    response = SimpleNamespace(status_code=404, headers={}, request=None)
+    error = hf_errors.HfHubHTTPError("missing repo", response=response)
+
+    def fail_download(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "validator.modules.robotics_vla.adapter.snapshot_download",
+        fail_download,
+    )
+    with pytest.raises(RoboticsSubmissionError) as excinfo:
+        resolve_model_dir("missing/repo", "bad-revision")
+    assert excinfo.value.failure_mode == "model_reference_invalid"
+
+
+def test_invalid_hub_reference_is_returned_as_zero_score_metrics(monkeypatch):
+    def fail_resolution(*_args, **_kwargs):
+        raise RoboticsSubmissionError(
+            "missing model revision",
+            failure_mode="model_reference_invalid",
+        )
+
+    monkeypatch.setattr(
+        "validator.modules.robotics_vla.resolve_model_dir",
+        fail_resolution,
+    )
+    module = RoboticsVLAValidationModule(config=RoboticsVLAConfig(device="cpu"))
+    metrics = module.validate(RoboticsVLAInputData(hg_repo_id="missing/repo"))
+
+    assert metrics.invalid_submission is True
+    assert metrics.score == 0.0
+    assert metrics.loss == 1.0
+    assert metrics.diagnostics["failure_mode"] == "model_reference_invalid"
+
+
+def test_transient_hub_failure_remains_recoverable(monkeypatch):
+    response = SimpleNamespace(status_code=503, headers={}, request=None)
+    error = hf_errors.HfHubHTTPError("service unavailable", response=response)
+
+    def fail_download(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "validator.modules.robotics_vla.adapter.snapshot_download",
+        fail_download,
+    )
+    with pytest.raises(hf_errors.HfHubHTTPError):
+        resolve_model_dir("org/repo", "main")
+
+
+def test_offline_cache_miss_remains_recoverable(monkeypatch):
+    error = hf_errors.LocalEntryNotFoundError("not cached while offline")
+
+    def fail_download(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        "validator.modules.robotics_vla.adapter.snapshot_download",
+        fail_download,
+    )
+    with pytest.raises(hf_errors.LocalEntryNotFoundError):
+        resolve_model_dir("org/repo", "main")

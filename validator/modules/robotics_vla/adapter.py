@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import types
+from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import numpy as np
+from huggingface_hub import errors as hf_errors
 from huggingface_hub import snapshot_download
 from loguru import logger
 
@@ -17,6 +22,11 @@ from validator.modules.robotics_vla.errors import RoboticsSubmissionError
 # converging quickly on a deterministically broken submission.
 MODEL_QUERY_RETRIES = 3
 
+DEFAULT_POLICY_LOAD_TIMEOUT_SECONDS = 10 * 60
+DEFAULT_POLICY_ACTION_TIMEOUT_SECONDS = 30
+DEFAULT_POLICY_MEMORY_LIMIT_BYTES = 64 * 1024**3
+DEFAULT_POLICY_CPU_TIME_SECONDS = 60 * 60
+
 
 def resolve_model_dir(repo_id_or_path: str, revision: str = "main") -> Path:
     candidate = Path(repo_id_or_path).expanduser()
@@ -24,8 +34,60 @@ def resolve_model_dir(repo_id_or_path: str, revision: str = "main") -> Path:
         return candidate.resolve()
 
     token = os.getenv("HF_TOKEN")
-    path = snapshot_download(repo_id=repo_id_or_path, revision=revision, token=token)
+    try:
+        path = snapshot_download(
+            repo_id=repo_id_or_path, revision=revision, token=token
+        )
+    except Exception as exc:
+        if not _is_deterministic_hub_error(exc):
+            raise
+        raise RoboticsSubmissionError(
+            f"Invalid Hugging Face model reference {repo_id_or_path!r} "
+            f"at revision {revision!r}: {exc}",
+            failure_mode="model_reference_invalid",
+        ) from exc
     return Path(path).resolve()
+
+
+def _is_deterministic_hub_error(exc: Exception) -> bool:
+    """Return whether a Hub failure is caused by the submitted reference.
+
+    Connection failures, server failures, request timeouts, and rate limits stay
+    recoverable. Malformed IDs and stable 4xx responses are invalid submissions.
+    """
+    local_miss_type = getattr(hf_errors, "LocalEntryNotFoundError", None)
+    if isinstance(local_miss_type, type) and isinstance(exc, local_miss_type):
+        return False
+
+    deterministic_types = tuple(
+        error_type
+        for error_type in (
+            getattr(hf_errors, "HFValidationError", None),
+            getattr(hf_errors, "RepositoryNotFoundError", None),
+            getattr(hf_errors, "RevisionNotFoundError", None),
+            getattr(hf_errors, "EntryNotFoundError", None),
+            getattr(hf_errors, "GatedRepoError", None),
+            getattr(hf_errors, "DisabledRepoError", None),
+            getattr(hf_errors, "BadRequestError", None),
+        )
+        if isinstance(error_type, type)
+    )
+    if isinstance(exc, deterministic_types):
+        return True
+
+    http_error_type = getattr(hf_errors, "HfHubHTTPError", None)
+    if isinstance(http_error_type, type) and isinstance(exc, http_error_type):
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        return (
+            isinstance(status_code, int)
+            and 400 <= status_code < 500
+            and status_code
+            not in {
+                408,
+                429,
+            }
+        )
+    return False
 
 
 def _load_python_module(path: Path) -> ModuleType:
@@ -42,6 +104,11 @@ def load_policy_from_adapter(
     adapter_filename: str,
     device: str,
     torch_dtype: str,
+    *,
+    load_timeout_seconds: float = DEFAULT_POLICY_LOAD_TIMEOUT_SECONDS,
+    action_timeout_seconds: float = DEFAULT_POLICY_ACTION_TIMEOUT_SECONDS,
+    memory_limit_bytes: int = DEFAULT_POLICY_MEMORY_LIMIT_BYTES,
+    cpu_time_seconds: int = DEFAULT_POLICY_CPU_TIME_SECONDS,
 ) -> Any:
     model_root = model_dir.resolve()
     adapter_path = model_root / adapter_filename
@@ -81,36 +148,21 @@ def load_policy_from_adapter(
                 failure_mode="adapter_symlink_escape",
             )
 
-    try:
-        module = _load_python_module(adapter_path)
-    except RoboticsSubmissionError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - adapter is untrusted miner code
-        raise RoboticsSubmissionError(
-            f"Robotics VLA adapter failed to import: {exc}",
-            failure_mode="adapter_import_failed",
-        ) from exc
-    if not hasattr(module, "load_policy"):
-        raise RoboticsSubmissionError(
-            f"{adapter_path} must define load_policy(model_dir, device, dtype)",
-            failure_mode="adapter_contract",
-        )
+    # Importing the adapter and invoking policy.act both happen in a persistent,
+    # credential-free sandbox process. The parent only accepts bounded JSON
+    # messages, never pickle data supplied by miner code.
+    from validator.modules.robotics_vla.isolation import IsolatedPolicy
 
-    policy = retry_model_query(
-        lambda: module.load_policy(
-            model_dir=str(model_root),
-            device=device,
-            dtype=torch_dtype,
-        ),
-        description="load_policy",
-        failure_mode="model_load_failed",
+    return IsolatedPolicy.start(
+        model_dir=model_root,
+        adapter_filename=adapter_filename,
+        device=device,
+        torch_dtype=torch_dtype,
+        load_timeout_seconds=load_timeout_seconds,
+        action_timeout_seconds=action_timeout_seconds,
+        memory_limit_bytes=memory_limit_bytes,
+        cpu_time_seconds=cpu_time_seconds,
     )
-    if not hasattr(policy, "act"):
-        raise RoboticsSubmissionError(
-            "Robotics VLA policy must expose act(obs) -> action",
-            failure_mode="adapter_contract",
-        )
-    return policy
 
 
 def retry_model_query(fn: Any, description: str, failure_mode: str) -> Any:
@@ -151,46 +203,180 @@ def count_model_parameters(model_dir: Path) -> int | None:
 
 
 def count_policy_parameters(policy: Any) -> int | None:
-    """Best-effort parameter count of an already-loaded policy.
+    """Recursively audit parameters reachable from a loaded policy.
 
-    Catches submissions whose repo weights look small (or are absent) but which
-    pull a large base model in at ``load_policy`` time. Returns ``None`` when no
-    torch parameters can be discovered (e.g. torch unavailable, or a non-torch
-    policy) so the caller can decide how to treat an unverifiable model. Only
-    ever reports a positive count it is confident about; it never guesses.
+    Containers, object attributes, function closures, and referenced globals are
+    walked with cycle protection. Returning ``0`` means the graph was audited and
+    contains no tensor parameters; ``None`` means some object was opaque or could
+    not be inspected, so the caller must reject the policy as unaccounted.
     """
+    # Only trust the validator-owned proxy metadata. An arbitrary miner policy
+    # may define an ``audited_parameter_count`` attribute and must not self-attest.
+    from validator.modules.robotics_vla.isolation import IsolatedPolicy
+
+    if isinstance(policy, IsolatedPolicy):
+        isolated_count = policy.audited_parameter_count
+        if isinstance(isolated_count, int) and isolated_count >= 0:
+            return isolated_count
+        return None
+
     try:
         import torch
     except ImportError:
+        torch = None
+
+    seen_objects: set[int] = set()
+    seen_arrays: set[int] = set()
+    total = 0
+    complete = True
+    stack = [policy]
+    try:
+        stack.append(getattr(policy, "act"))
+    except Exception:  # noqa: BLE001 - untrusted policy object
         return None
 
-    seen: set[int] = set()
-    total = 0
-    found = False
+    atomic_types = (str, bytes, bytearray, int, float, complex, bool, type(None), Path)
 
-    def _add(module: Any) -> None:
-        nonlocal total, found
-        params = getattr(module, "parameters", None)
-        if not callable(params):
+    def _add_array(value: Any) -> None:
+        nonlocal total
+        marker = id(value)
+        if marker in seen_arrays:
             return
+        seen_arrays.add(marker)
+        total += int(
+            value.numel()
+            if torch is not None and isinstance(value, torch.Tensor)
+            else value.size
+        )
+
+    while stack:
+        value = stack.pop()
+        if isinstance(value, atomic_types):
+            continue
+        marker = id(value)
+        if marker in seen_objects:
+            continue
+        seen_objects.add(marker)
+
+        if torch is not None and isinstance(value, torch.Tensor):
+            _add_array(value)
+            continue
+        if isinstance(value, np.ndarray):
+            _add_array(value)
+            continue
+        if isinstance(value, Mapping):
+            try:
+                for key, item in value.items():
+                    stack.extend((key, item))
+            except Exception:  # noqa: BLE001 - untrusted container
+                complete = False
+            continue
+        if isinstance(value, (list, tuple, set, frozenset, deque)):
+            try:
+                stack.extend(value)
+            except Exception:  # noqa: BLE001 - untrusted container
+                complete = False
+            continue
+        if isinstance(value, types.MethodType):
+            stack.extend((value.__self__, value.__func__))
+            continue
+        if isinstance(value, types.FunctionType):
+            stack.extend(value.__defaults__ or ())
+            stack.extend((value.__kwdefaults__ or {}).values())
+            if value.__closure__:
+                for cell in value.__closure__:
+                    try:
+                        stack.append(cell.cell_contents)
+                    except ValueError:
+                        continue
+            for name in value.__code__.co_names:
+                global_value = value.__globals__.get(name)
+                if _may_contain_parameters(global_value, torch):
+                    stack.append(global_value)
+            continue
+        if isinstance(
+            value, (ModuleType, type, types.CodeType, types.BuiltinFunctionType)
+        ):
+            continue
+        if torch is not None and isinstance(value, (torch.device, torch.dtype)):
+            continue
+        if isinstance(value, np.dtype):
+            continue
+
+        attributes_found = False
         try:
-            iterator = params()
+            attributes = vars(value)
+        except TypeError:
+            attributes = None
         except Exception:  # noqa: BLE001 - untrusted policy object
-            return
-        for param in iterator:
-            if id(param) in seen:
+            attributes = None
+            complete = False
+        if attributes is not None:
+            attributes_found = True
+            stack.extend(attributes.values())
+
+        slots = getattr(type(value), "__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            try:
+                stack.append(getattr(value, slot))
+                attributes_found = True
+            except AttributeError:
                 continue
-            seen.add(id(param))
-            total += int(param.numel())
-            found = True
+            except Exception:  # noqa: BLE001 - untrusted policy object
+                complete = False
 
-    if isinstance(policy, torch.nn.Module):
-        _add(policy)
-    for value in (vars(policy).values() if hasattr(policy, "__dict__") else []):
-        if isinstance(value, torch.nn.Module):
-            _add(value)
+        # Instance __dict__/__slots__ alone miss a model stashed at class level:
+        # ``class P: weights = big_model`` or a ``@property`` that returns it.
+        # Walk class-level *data* attributes (skipping methods and other
+        # descriptors, whose globals would explode the traversal) and property
+        # getters so weights hidden on the class cannot zero out the count.
+        try:
+            mro = type(value).__mro__
+        except Exception:  # noqa: BLE001 - untrusted policy type
+            mro = ()
+            complete = False
+        for klass in mro:
+            if klass in (object,):
+                continue
+            try:
+                class_dict = vars(klass)
+            except TypeError:
+                continue
+            for name, attr in class_dict.items():
+                if name.startswith("__") and name.endswith("__"):
+                    continue
+                if isinstance(attr, property):
+                    if attr.fget is not None:
+                        stack.append(attr.fget)
+                    continue
+                # Functions, staticmethod/classmethod, and custom descriptors are
+                # not where weights live; skipping them also avoids re-walking
+                # every method's module globals.
+                if hasattr(type(attr), "__get__"):
+                    continue
+                if _may_contain_parameters(attr, torch):
+                    stack.append(attr)
 
-    return total if found else None
+        if not attributes_found:
+            # Any non-atomic opaque value could retain model state that is not
+            # visible to the auditor (including generators and C extensions).
+            complete = False
+
+    return total if complete else None
+
+
+def _may_contain_parameters(value: Any, torch: Any) -> bool:
+    if value is None or isinstance(value, (str, bytes, int, float, complex, bool)):
+        return False
+    if isinstance(value, (ModuleType, type)):
+        return False
+    if isinstance(value, (np.ndarray, Mapping, list, tuple, set, frozenset, deque)):
+        return True
+    if torch is not None and isinstance(value, (torch.Tensor, torch.nn.Module)):
+        return True
+    return True
 
 
 def enforce_parameter_limit(
@@ -205,13 +391,15 @@ def enforce_parameter_limit(
     silently admitted, closing the gap where an unrecognized weight format (or a
     base model fetched at runtime) bypassed the cap entirely.
     """
-    counts = [count for count in (repo_count, policy_count) if count is not None]
-    if not counts:
+    if policy_count is None:
         raise RoboticsSubmissionError(
-            "Could not determine the model parameter count from repo weights or the "
-            f"loaded policy; cannot verify it is within the {max_params} parameter cap",
+            "Could not fully account for parameters reachable from the loaded policy; "
+            f"cannot verify it is within the {max_params} parameter cap",
             failure_mode="parameter_count_unknown",
         )
+    counts = [policy_count]
+    if repo_count is not None:
+        counts.append(repo_count)
     best = max(counts)
     if best > max_params:
         raise RoboticsSubmissionError(
@@ -232,7 +420,14 @@ def _count_safetensors(model_dir: Path) -> int | None:
     for path in files:
         with safe_open(path, framework="pt", device="cpu") as handle:
             for key in handle.keys():
-                shape = handle.get_tensor(key).shape
+                # Read the shape from the header without materializing the tensor;
+                # counting a 4.5B model must not load the whole model into the
+                # validator's memory. Fall back to a full read only if the slice
+                # API is unavailable in an older safetensors build.
+                try:
+                    shape = handle.get_slice(key).get_shape()
+                except (AttributeError, TypeError):
+                    shape = handle.get_tensor(key).shape
                 params = 1
                 for dim in shape:
                     params *= int(dim)
@@ -264,7 +459,11 @@ def _count_torch_state_dicts(model_dir: Path) -> int | None:
                 "Upgrade PyTorch to enable weights_only=True.",
                 failure_mode="unsupported_torch_version",
             )
-        if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        if (
+            isinstance(obj, dict)
+            and "state_dict" in obj
+            and isinstance(obj["state_dict"], dict)
+        ):
             obj = obj["state_dict"]
         if not isinstance(obj, dict):
             continue

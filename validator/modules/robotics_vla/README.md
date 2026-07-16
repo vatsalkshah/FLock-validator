@@ -13,9 +13,9 @@ flowchart TD
     C --> D{Exceeds 4.5B cap?}
     D -- yes --> ZERO1["score = 0\ninvalid_submission = true"]
     D -- no --> E["Resolve Validation Package\ndownload + unzip manifest.json"]
-    E --> F["Load Adapter\nflock_robotics_adapter.py"]
-    F --> G["load_policy(model_dir, device, dtype)"]
-    G --> H["Count Live Policy Parameters\npost-load check"]
+    E --> F["Start Sandboxed Policy Worker\nno credentials · no network · resource limits"]
+    F --> G["Load Adapter + Policy\ninside worker process"]
+    G --> H["Recursively Audit Live Parameters\ncontainers + cycle protection"]
     H --> I{Exceeds 4.5B cap?}
     I -- yes --> ZERO2["score = 0\ninvalid_submission = true"]
     I -- no --> J["Episode Rollouts\nMuJoCo · Robosuite · Panda arm"]
@@ -24,6 +24,22 @@ flowchart TD
 ```
 
 Each step that touches miner code retries up to 3 times on transient failure before the submission is declared invalid.
+
+### Adapter isolation
+
+Miner Python never executes in the validator process. A persistent worker imports
+the adapter, loads the model, and serves `policy.act` calls over a bounded JSON
+protocol (pickle is never accepted from the worker). The worker:
+
+- receives an environment allowlist with no `FLOCK_API_KEY`, `HF_TOKEN`, cloud
+  credentials, proxy settings, or validator home directory;
+- has CPU, address-space, open-file, output-file, and per-call wall-time limits;
+- cannot create child processes, execute other programs, or use network syscalls
+  under the production Linux seccomp policy; and
+- is killed as a process group on timeout or protocol failure.
+
+Consequently, all model code and weights needed at inference time must be present
+in the downloaded repository. An adapter cannot fetch a base model at runtime.
 
 ---
 
@@ -72,7 +88,7 @@ Miners must push a HuggingFace repository containing:
 | File | Required | Description |
 |------|----------|-------------|
 | `flock_robotics_adapter.py` | **Yes** | Defines `load_policy(model_dir, device, dtype) → policy` where `policy.act(obs) → np.ndarray shape (7,)` |
-| Model weights | **Yes** | `*.safetensors` or `*.pt` / `*.bin` files. Total parameter count must be ≤ 4.5 B (checked both in the repo and after loading). |
+| Model weights | **Yes** | `*.safetensors` or `*.pt` / `*.bin` files. Total parameter count must be ≤ 4.5 B (checked both in the repo and by recursively auditing the live policy graph). Opaque/unaccounted policy state is rejected. |
 
 ### Observation dict passed to `policy.act`
 
@@ -300,7 +316,11 @@ The submission was scored 0. The `diagnostics.failure_mode` field explains why:
 | `adapter_contract` | Adapter filename escapes the model directory |
 | `adapter_import_failed` | The adapter file raised an exception on import |
 | `model_load_failed` | `load_policy(...)` raised an exception after retries |
+| `model_reference_invalid` | Hugging Face repo/revision is malformed, missing, gated, or returns a deterministic 4xx response |
 | `invalid_action` | `policy.act(obs)` returned a non-numeric, wrong-shape, or NaN/Inf array |
 | `policy_execution_failed` | `policy.act(obs)` raised an exception after retries |
+| `model_load_timeout` / `policy_timeout` | Sandboxed model loading or action inference exceeded its wall-time limit |
+| `policy_protocol_error` | Worker returned malformed or oversized protocol data |
+| `sandbox_unavailable` | The host cannot provide the required adapter isolation |
 | `parameter_limit_exceeded` | Parameter count exceeds `max_params` (checked pre- and post-load) |
-| `parameter_count_unknown` | Could not determine parameter count from repo weights or loaded policy |
+| `parameter_count_unknown` | Loaded policy graph contains opaque/unaccounted state |
