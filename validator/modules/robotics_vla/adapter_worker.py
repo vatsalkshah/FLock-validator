@@ -42,16 +42,14 @@ def main() -> None:
     os.close(devnull)
 
     try:
-        _apply_resource_limits(args.memory_limit_bytes, args.cpu_time_seconds)
+        _apply_resource_limits(
+            args.memory_limit_bytes, args.cpu_time_seconds, args.device
+        )
         _install_linux_filesystem_sandbox(Path(args.model_dir))
         _install_linux_seccomp()
+        _apply_gpu_memory_limit(args.device, args.memory_limit_bytes)
         policy = _load_policy(args)
-        parameter_count = count_policy_parameters(policy)
-        if parameter_count is None:
-            raise RoboticsSubmissionError(
-                "The loaded policy contains objects whose parameters cannot be audited",
-                failure_mode="parameter_count_unknown",
-            )
+        parameter_count = _count_policy_parameters_safe(policy, args)
         write_worker_message(
             protocol_out,
             {"ok": True, "parameter_count": parameter_count},
@@ -127,6 +125,54 @@ def _load_policy(args: argparse.Namespace) -> Any:
     return policy
 
 
+def _count_policy_parameters_safe(
+    policy: Any, args: argparse.Namespace
+) -> int | None:
+    """Best-effort parameter count for telemetry only.
+
+    Model size is enforced at runtime by the host memory monitor and the CUDA
+    allocator cap, not by this number, so it never raises and never gates: a
+    submission that fits in the memory budget is allowed however many parameters
+    it holds, and an unaccountable graph is reported as unknown rather than
+    rejected.
+    """
+    try:
+        return count_policy_parameters(
+            policy,
+            module_roots=(Path(args.model_dir).resolve(),),
+        )
+    except Exception:  # noqa: BLE001 - telemetry must not break action serving
+        return None
+
+
+def _apply_gpu_memory_limit(device: str, memory_limit_bytes: int) -> None:
+    """Cap this process's CUDA allocator so an oversize model fails at load.
+
+    Best-effort and a no-op off CUDA or without torch. The driver-enforced cap is
+    the primary VRAM bound; the host-side memory monitor bounds system RAM. Raw,
+    non-torch CUDA allocations are not covered by this cap (documented residual).
+    """
+    if not device.lower().startswith("cuda"):
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        index = torch.device(device).index
+    except Exception:  # noqa: BLE001 - fall back to the active device
+        index = None
+    if index is None:
+        index = torch.cuda.current_device()
+    total = torch.cuda.get_device_properties(index).total_memory
+    if total <= 0:
+        return
+    fraction = min(1.0, memory_limit_bytes / total)
+    torch.cuda.set_per_process_memory_fraction(fraction, index)
+
+
 def _write_error(stream: Any, exc: Exception, fallback_mode: str) -> None:
     write_worker_message(
         stream,
@@ -138,16 +184,21 @@ def _write_error(stream: Any, exc: Exception, fallback_mode: str) -> None:
     )
 
 
-def _apply_resource_limits(memory_limit_bytes: int, cpu_time_seconds: int) -> None:
+def _apply_resource_limits(
+    memory_limit_bytes: int, cpu_time_seconds: int, device: str
+) -> None:
     limits = [
         (resource.RLIMIT_CPU, cpu_time_seconds),
         (resource.RLIMIT_FSIZE, 64 * 1024**2),
         (resource.RLIMIT_NOFILE, 64),
     ]
-    # Darwin commonly starts Python with a virtual address space larger than a
-    # finite RLIMIT_AS and refuses to lower it. Production Linux workers enforce
-    # the configured address-space cap before any miner code is imported.
-    if platform.system() == "Linux":
+    # RLIMIT_AS bounds *virtual* address space. A CUDA context reserves far more
+    # VA than it uses, so a model-sized RLIMIT_AS would break GPU init — there the
+    # CUDA allocator cap bounds VRAM and the host memory monitor bounds system RAM.
+    # On CPU the weights live in the address space, so keep the hard cap as a
+    # kernel-enforced backstop. (Darwin refuses to lower an infinite RLIMIT_AS, so
+    # it is Linux-only regardless.)
+    if platform.system() == "Linux" and not device.lower().startswith("cuda"):
         limits.insert(0, (resource.RLIMIT_AS, memory_limit_bytes))
     for key, requested in limits:
         current_soft, current_hard = resource.getrlimit(key)

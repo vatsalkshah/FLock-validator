@@ -8,17 +8,14 @@ Validates Vision-Language-Action (VLA) policies submitted to [FLock AI Arena](ht
 
 ```mermaid
 flowchart TD
-    A["FedLedger Assignment\nhg_repo_id · validation_data_url · max_params"] --> B["Download HF Repo\nsnapshot_download"]
-    B --> C["Count Repo Parameters\nsafetensors / state-dicts"]
-    C --> D{Exceeds 4.5B cap?}
-    D -- yes --> ZERO1["score = 0\ninvalid_submission = true"]
-    D -- no --> E["Resolve Validation Package\ndownload + unzip manifest.json"]
-    E --> F["Start Sandboxed Policy Worker\nno credentials · no network · resource limits"]
+    A["FedLedger Assignment\nhg_repo_id · validation_data_url"] --> B["Download HF Repo\nsnapshot_download"]
+    B --> C["Count Repo Parameters\nsafetensors / state-dicts (telemetry)"]
+    C --> E["Resolve Validation Package\ndownload + unzip manifest.json"]
+    E --> F["Start Sandboxed Policy Worker\nno credentials · no network · 18 GiB memory cap"]
     F --> G["Load Adapter + Policy\ninside worker process"]
-    G --> H["Recursively Audit Live Parameters\ncontainers + cycle protection"]
-    H --> I{Exceeds 4.5B cap?}
-    I -- yes --> ZERO2["score = 0\ninvalid_submission = true"]
-    I -- no --> J["Episode Rollouts\nMuJoCo · Robosuite · Panda arm"]
+    G --> H{"Exceeds 18 GiB\nmemory budget?"}
+    H -- yes --> ZERO2["score = 0\ninvalid_submission = true\npolicy_memory_exceeded"]
+    H -- no --> J["Episode Rollouts\nMuJoCo · Robosuite · Panda arm"]
     J --> K["Compute Score\nweighted episode scores"]
     K --> L["Submit to FedLedger\nmetrics.model_dump"]
 ```
@@ -33,13 +30,41 @@ protocol (pickle is never accepted from the worker). The worker:
 
 - receives an environment allowlist with no `FLOCK_API_KEY`, `HF_TOKEN`, cloud
   credentials, proxy settings, or validator home directory;
-- has CPU, address-space, open-file, output-file, and per-call wall-time limits;
+- has CPU, open-file, output-file, and per-call wall-time limits, plus the memory
+  ceiling described below;
 - cannot create child processes, execute other programs, or use network syscalls
   under the production Linux seccomp policy; and
-- is killed as a process group on timeout or protocol failure.
+- is killed as a process group on timeout, protocol failure, or a memory breach.
 
 Consequently, all model code and weights needed at inference time must be present
 in the downloaded repository. An adapter cannot fetch a base model at runtime.
+
+### Model-size limit (runtime memory, not parameter count)
+
+Model size is bounded by a hard **memory ceiling on the policy worker** —
+`policy_memory_limit_gb` (default **18 GiB**) — not by a static parameter count.
+A static count can be defeated by reconstructing weights at inference time (from a
+`bytes`/`str` blob, a file, a dependency module, or a dynamic lookup), so it is
+reported only as telemetry. The memory ceiling is representation-agnostic:
+however the weights are encoded, they occupy memory, and the worker is held to the
+budget two ways:
+
+- **GPU VRAM** — the worker caps its CUDA allocator
+  (`torch.cuda.set_per_process_memory_fraction`) so an oversize model hard-OOMs at
+  load. Raw, non-`torch` CUDA allocations are not covered by this cap.
+- **System RAM** — a host-side monitor polls the worker's resident memory and
+  kills it (→ `policy_memory_exceeded`) if it stays over budget. This closes the
+  "hide weights in host RAM and stream them to the GPU" path. On CPU deployments a
+  kernel `RLIMIT_AS` backstop is applied as well; on CUDA it is not, because a
+  model-sized address-space limit would break CUDA initialisation.
+
+A submission that fits in the budget may hold however many parameters it likes
+(e.g. a larger quantized model), so the effective cap scales with dtype: 18 GiB is
+roughly a 4.5B-parameter model in fp32, or a larger one in bf16/int8.
+
+> **Operator note:** for a hard, kernel-enforced ceiling that also covers raw CUDA
+> allocations, run the validator (and thus the worker) inside a container with a
+> cgroup memory limit. The in-process controls above are the portable default.
 
 ---
 
@@ -88,7 +113,7 @@ Miners must push a HuggingFace repository containing:
 | File | Required | Description |
 |------|----------|-------------|
 | `flock_robotics_adapter.py` | **Yes** | Defines `load_policy(model_dir, device, dtype) → policy` where `policy.act(obs) → np.ndarray shape (7,)` |
-| Model weights | **Yes** | `*.safetensors` or `*.pt` / `*.bin` files. Total parameter count must be ≤ 4.5 B (checked both in the repo and by recursively auditing the live policy graph). Opaque/unaccounted policy state is rejected. |
+| Model weights | **Yes** | `*.safetensors` or `*.pt` / `*.bin` files. The policy (weights + inference working set) must fit within the sandbox memory ceiling (default **18 GiB**); see [Model-size limit](#model-size-limit-runtime-memory-not-parameter-count). Parameter count is reported as telemetry, not enforced. |
 
 ### Observation dict passed to `policy.act`
 
@@ -123,7 +148,8 @@ Values outside `[-1, 1]` are clipped. Actions are mapped to the Panda OSC contro
 
 - **GPU**: CUDA-capable GPU strongly recommended (the validator loads full VLM weights).
   The reference model (Qwen2.5-VL-3B + 1.2 B action head ≈ 4.06 B params) fits in ~10 GB VRAM at bfloat16.
-  The parameter cap for this task is **4.5 B parameters** (checked both pre-load and post-load).
+  The policy sandbox is held to a **18 GiB memory ceiling** (`policy_memory_limit_gb`);
+  see [Model-size limit](#model-size-limit-runtime-memory-not-parameter-count).
 - **RAM**: ≥ 32 GB system RAM for large model repos.
 - **Disk**: ≥ 30 GB free for model cache + robosuite assets.
 
@@ -322,5 +348,4 @@ The submission was scored 0. The `diagnostics.failure_mode` field explains why:
 | `model_load_timeout` / `policy_timeout` | Sandboxed model loading or action inference exceeded its wall-time limit |
 | `policy_protocol_error` | Worker returned malformed or oversized protocol data |
 | `sandbox_unavailable` | The host cannot provide the required adapter isolation |
-| `parameter_limit_exceeded` | Parameter count exceeds `max_params` (checked pre- and post-load) |
-| `parameter_count_unknown` | Loaded policy graph contains opaque/unaccounted state |
+| `policy_memory_exceeded` | The policy exceeded the sandbox memory ceiling (`policy_memory_limit_gb`, default 18 GiB) at load or during rollout |

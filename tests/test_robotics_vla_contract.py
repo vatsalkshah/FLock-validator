@@ -10,7 +10,6 @@ from huggingface_hub import errors as hf_errors
 
 from validator.modules.robotics_vla.adapter import (
     count_policy_parameters,
-    enforce_parameter_limit,
     load_policy_from_adapter,
     resolve_model_dir,
 )
@@ -685,6 +684,139 @@ def load_policy(model_dir, device, dtype):
     assert excinfo.value.failure_mode == "policy_timeout"
 
 
+def test_adapter_worker_counts_model_on_dependency_module_for_telemetry(
+    tmp_path: Path,
+):
+    # Parameter count is telemetry (model size is enforced by the memory limit),
+    # but it should still account for weights a policy parks on a dependency
+    # module and reads back from act().
+    (tmp_path / "flock_robotics_adapter.py").write_text(
+        """
+import numpy as np
+
+np.HIDDEN = np.zeros(100, dtype=np.float32)
+
+class Policy:
+    def act(self, obs):
+        return np.HIDDEN[:7]
+
+def load_policy(model_dir, device, dtype):
+    return Policy()
+"""
+    )
+
+    policy = load_policy_from_adapter(
+        tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+    )
+    try:
+        assert policy.audited_parameter_count == 100
+    finally:
+        policy.close()
+
+
+def test_adapter_worker_counts_object_wrapped_model_for_telemetry(tmp_path: Path):
+    # A submitted-class wrapper nested inside a container on a dependency module
+    # is still walked for the telemetry count.
+    (tmp_path / "flock_robotics_adapter.py").write_text(
+        """
+import numpy as np
+
+class _Weights:
+    pass
+
+_holder = _Weights()
+_holder.model = np.zeros(100, dtype=np.float32)
+np.HIDDEN = [_holder]
+
+class Policy:
+    def act(self, obs):
+        return np.HIDDEN[0].model[:7]
+
+def load_policy(model_dir, device, dtype):
+    return Policy()
+"""
+    )
+
+    policy = load_policy_from_adapter(
+        tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+    )
+    try:
+        assert policy.audited_parameter_count == 100
+    finally:
+        policy.close()
+
+
+def test_adapter_worker_scan_of_dependency_module_does_not_inflate_count(
+    tmp_path: Path,
+):
+    # Referencing a dependency module from act() (so the auditor scans it) must
+    # not over-count a legitimately small policy.
+    (tmp_path / "flock_robotics_adapter.py").write_text(
+        """
+import numpy as np
+
+class Policy:
+    def __init__(self):
+        self.w = np.zeros(10, dtype=np.float32)
+
+    def act(self, obs):
+        return np.asarray(self.w[:7]) * np.float32(1.0)
+
+def load_policy(model_dir, device, dtype):
+    return Policy()
+"""
+    )
+
+    policy = load_policy_from_adapter(
+        tmp_path, "flock_robotics_adapter.py", "cpu", "float32"
+    )
+    try:
+        assert policy.audited_parameter_count == 10
+    finally:
+        policy.close()
+
+
+def test_policy_sandbox_rejects_over_budget_policy(tmp_path: Path):
+    # The runtime memory ceiling is the authoritative model-size bound: a policy
+    # that holds more than the budget is rejected regardless of how the weights
+    # are represented. Here ~300 MB of resident bytes exceed a 200 MB limit.
+    #
+    # On macOS (and on the CUDA deployment) RLIMIT_AS is not the model-size cap,
+    # so the host memory monitor observes the resident bytes and kills the worker
+    # -> policy_memory_exceeded. On Linux/CPU the kernel RLIMIT_AS backstop trips
+    # the allocation first -> model_load_failed. Both are the enforcement working.
+    (tmp_path / "flock_robotics_adapter.py").write_text(
+        """
+import time
+
+class Policy:
+    def act(self, obs):
+        return [0.0] * 7
+
+def load_policy(model_dir, device, dtype):
+    hog = bytearray(300_000_000)   # ~300 MB, resident (zero-filled by CPython)
+    time.sleep(1.5)                # give the memory monitor time to observe it
+    policy = Policy()
+    policy._hog = hog
+    return policy
+"""
+    )
+
+    with pytest.raises(RoboticsSubmissionError) as excinfo:
+        load_policy_from_adapter(
+            tmp_path,
+            "flock_robotics_adapter.py",
+            "cpu",
+            "float32",
+            memory_limit_bytes=200 * 1024 * 1024,
+        )
+    mode = excinfo.value.failure_mode
+    if sys.platform == "darwin":
+        assert mode == "policy_memory_exceeded"
+    else:
+        assert mode in {"policy_memory_exceeded", "model_load_failed"}
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux seccomp behavior")
 def test_adapter_worker_denies_network_filesystem_and_process_escape(tmp_path: Path):
     model_dir = tmp_path / "model"
@@ -917,30 +1049,7 @@ def test_runner_does_not_crash_on_bad_submission():
     assert runner.api.failed == ["assignment-1"]
 
 
-# --- Issue 2: the parameter cap is actually enforced -------------------------
-
-
-def test_enforce_parameter_limit_rejects_unknown_count():
-    with pytest.raises(RoboticsSubmissionError) as excinfo:
-        enforce_parameter_limit(None, None, 4_500_000_000)
-    assert excinfo.value.failure_mode == "parameter_count_unknown"
-
-
-def test_enforce_parameter_limit_rejects_oversized_policy():
-    # Repo weights look tiny, but the loaded policy is over the cap.
-    with pytest.raises(RoboticsSubmissionError) as excinfo:
-        enforce_parameter_limit(1_000, 5_000_000_000, 4_500_000_000)
-    assert excinfo.value.failure_mode == "parameter_limit_exceeded"
-
-
-def test_enforce_parameter_limit_returns_best_known_count():
-    assert enforce_parameter_limit(1_000, 350_000, 4_500_000_000) == 350_000
-
-
-def test_enforce_parameter_limit_rejects_unaccounted_policy_even_with_repo_count():
-    with pytest.raises(RoboticsSubmissionError) as excinfo:
-        enforce_parameter_limit(420_000, None, 4_500_000_000)
-    assert excinfo.value.failure_mode == "parameter_count_unknown"
+# --- Parameter counting is telemetry; model size is enforced by memory --------
 
 
 def test_count_policy_parameters_handles_non_torch_policy():
@@ -1099,3 +1208,78 @@ def test_offline_cache_miss_remains_recoverable(monkeypatch):
     )
     with pytest.raises(hf_errors.LocalEntryNotFoundError):
         resolve_model_dir("org/repo", "main")
+
+
+# --- Runtime memory ceiling (the authoritative model-size enforcement) --------
+
+
+def test_read_process_rss_reports_plausible_value_for_self():
+    import os
+
+    from validator.modules.robotics_vla.memory_monitor import read_process_rss_bytes
+
+    rss = read_process_rss_bytes(os.getpid())
+    assert isinstance(rss, int) and rss > 1_000_000
+
+
+def test_memory_monitor_kills_process_over_limit():
+    import subprocess
+
+    from validator.modules.robotics_vla.memory_monitor import MemoryMonitor
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    monitor = MemoryMonitor(
+        proc.pid,
+        limit_bytes=1_000,
+        sampler=lambda _pid: 2_000,  # force a breach without a huge allocation
+        poll_interval_seconds=0.01,
+        breaches_before_kill=2,
+    )
+    monitor.start()
+    try:
+        proc.wait(timeout=5)
+    finally:
+        monitor.stop()
+    assert monitor.breached is True
+    assert monitor.observed_at_kill == 2_000
+    assert proc.poll() is not None
+
+
+def test_memory_monitor_leaves_process_under_limit_alone():
+    import subprocess
+    import time
+
+    from validator.modules.robotics_vla.memory_monitor import MemoryMonitor
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2)"], start_new_session=True
+    )
+    monitor = MemoryMonitor(
+        proc.pid,
+        limit_bytes=10**12,
+        sampler=lambda _pid: 5_000,
+        poll_interval_seconds=0.01,
+        breaches_before_kill=2,
+    )
+    monitor.start()
+    try:
+        time.sleep(0.2)
+        assert proc.poll() is None  # still alive while under budget
+    finally:
+        monitor.stop()
+        proc.terminate()
+        proc.wait(timeout=5)
+    assert monitor.breached is False
+
+
+def test_memory_monitor_is_disabled_for_nonpositive_limit():
+    from validator.modules.robotics_vla.memory_monitor import MemoryMonitor
+
+    monitor = MemoryMonitor(
+        pid=-1, limit_bytes=0, sampler=lambda _pid: 10**9, poll_interval_seconds=0.01
+    )
+    monitor.start()  # no-op: an unbounded limit means no monitoring thread
+    monitor.stop()
+    assert monitor.breached is False

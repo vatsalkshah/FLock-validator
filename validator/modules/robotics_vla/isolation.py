@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from validator.modules.robotics_vla.errors import RoboticsSubmissionError
+from validator.modules.robotics_vla.memory_monitor import MemoryMonitor
 
 
 _HEADER = struct.Struct("!Q")
@@ -45,12 +46,16 @@ class IsolatedPolicy:
         process: subprocess.Popen[bytes],
         temp_dir: tempfile.TemporaryDirectory[str],
         action_timeout_seconds: float,
-        audited_parameter_count: int,
+        audited_parameter_count: int | None,
+        memory_monitor: MemoryMonitor | None = None,
     ) -> None:
         self._process = process
         self._temp_dir = temp_dir
         self._action_timeout_seconds = action_timeout_seconds
+        # Telemetry only (int, or None when the graph could not be fully walked).
+        # Model size is enforced by the memory monitor below, not this count.
         self.audited_parameter_count = audited_parameter_count
+        self._memory_monitor = memory_monitor
         self._closed = False
 
     @classmethod
@@ -103,19 +108,27 @@ class IsolatedPolicy:
             temp_dir.cleanup()
             raise
 
+        # Enforce the model-size ceiling on the live process: however the weights
+        # are represented, they occupy memory. This is the authoritative bound;
+        # the parameter count reported below is telemetry only.
+        monitor = MemoryMonitor(process.pid, memory_limit_bytes)
+        monitor.start()
         proxy = cls(
-            process, temp_dir, action_timeout_seconds, audited_parameter_count=0
+            process,
+            temp_dir,
+            action_timeout_seconds,
+            audited_parameter_count=None,
+            memory_monitor=monitor,
         )
         try:
             response = proxy._receive(load_timeout_seconds, "model_load_timeout")
             proxy._raise_if_error(response, "model_load_failed")
             parameter_count = response.get("parameter_count")
-            if not isinstance(parameter_count, int) or parameter_count < 0:
-                raise RoboticsSubmissionError(
-                    "The sandbox could not fully audit the loaded policy parameter graph",
-                    failure_mode="parameter_count_unknown",
-                )
-            proxy.audited_parameter_count = parameter_count
+            proxy.audited_parameter_count = (
+                parameter_count
+                if isinstance(parameter_count, int) and parameter_count >= 0
+                else None
+            )
             return proxy
         except Exception:
             proxy.close()
@@ -136,6 +149,8 @@ class IsolatedPolicy:
         if self._closed:
             return
         self._closed = True
+        if self._memory_monitor is not None:
+            self._memory_monitor.stop()
         process = self._process
         try:
             if process.poll() is None:
@@ -172,6 +187,10 @@ class IsolatedPolicy:
 
     def _send(self, message: dict[str, Any]) -> None:
         if self._process.stdin is None or self._process.poll() is not None:
+            # If the monitor killed the worker for exceeding its memory budget,
+            # report that rather than a generic exit — otherwise the per-action
+            # retry loop would mask the real cause on subsequent sends.
+            self._raise_if_memory_exceeded()
             raise RoboticsSubmissionError(
                 "Policy sandbox exited unexpectedly",
                 failure_mode="policy_execution_failed",
@@ -187,6 +206,7 @@ class IsolatedPolicy:
             self._process.stdin.write(payload)
             self._process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
+            self._raise_if_memory_exceeded(exc)
             raise RoboticsSubmissionError(
                 "Policy sandbox exited while receiving an observation",
                 failure_mode="policy_execution_failed",
@@ -215,6 +235,7 @@ class IsolatedPolicy:
             return response
         except TimeoutError as exc:
             _kill_process_group(self._process)
+            self._raise_if_memory_exceeded(exc)
             raise RoboticsSubmissionError(
                 f"Policy sandbox exceeded its {timeout_seconds:g}s wall-time limit",
                 failure_mode=timeout_mode,
@@ -230,10 +251,25 @@ class IsolatedPolicy:
             ValueError,
         ) as exc:
             _kill_process_group(self._process)
+            # A memory-limit kill closes the pipe; surface it as such rather than a
+            # generic protocol error so the miner sees why the submission failed.
+            self._raise_if_memory_exceeded(exc)
             raise RoboticsSubmissionError(
                 f"Policy sandbox returned an invalid protocol response: {exc}",
                 failure_mode="policy_protocol_error",
             ) from exc
+
+    def _raise_if_memory_exceeded(self, cause: BaseException | None = None) -> None:
+        monitor = self._memory_monitor
+        if monitor is None or not monitor.breached:
+            return
+        limit_gib = monitor.limit_bytes / 1024**3
+        observed_gib = monitor.observed_at_kill / 1024**3
+        raise RoboticsSubmissionError(
+            f"Policy sandbox exceeded its {limit_gib:.0f} GiB memory limit "
+            f"(observed {observed_gib:.1f} GiB)",
+            failure_mode="policy_memory_exceeded",
+        ) from cause
 
     @staticmethod
     def _raise_if_error(response: dict[str, Any], fallback_mode: str) -> None:
