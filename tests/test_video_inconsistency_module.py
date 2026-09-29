@@ -196,7 +196,7 @@ def test_config_defaults_match_production_config_file():
         config_dir="configs",
     )
     assert from_file == VideoInconsistencyConfig()
-    assert from_file.device == "cuda"
+    assert from_file.device == "cpu"
     assert from_file.detector_memory_limit_gb == 18
     assert from_file.suite_version == SUITE_VERSION
 

@@ -203,7 +203,7 @@ Defaults live in [`configs/video_inconsistency.json`](../../../configs/video_inc
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `suite_version` | `video_inconsistency_v2` | Must match the package manifest, else the assignment is re-queued |
-| `device` / `torch_dtype` | `cuda` / `bfloat16` | Passed to `load_detector` |
+| `device` / `torch_dtype` | `cpu` / `float32` | Passed to `load_detector`. CPU until CUDA initialisation inside the sandbox is fixed (see Known limitations) |
 | `package_cache_dir` | `.cache/video_inconsistency/package_cache` | Extracted package cache |
 | `max_clips` | `null` | Evaluate only the first N clips (smoke tests) |
 | `detector_load_timeout_seconds` | 600 | Wall-time limit for adapter import + `load_detector` |
@@ -312,3 +312,12 @@ No. See [Sandbox](#sandbox).
 ### Why did a perfect-looking detector score below 1?
 
 Check `per_type_ap` and `ap_by_tiou` first: a high-confidence false alarm ranked above a correct finding lowers that type's AP, duplicate predictions of one issue are false positives, any prediction of a type that has no ground truth anywhere gives that type AP 0, sloppy boundaries only score at the lower tIoU thresholds, and spatial issues need a bbox with IoU >= `bbox_iou_threshold` to count at all. Decoys (legitimate cuts, exposure / white-balance drift, smooth zooms, objects entering / leaving / stopping, camera stops) are the usual source of false alarms. `diagnostics.per_type_counts` holds the thresholded TP / FP / FN counts.
+
+## Known limitations
+
+- **GPU inside the sandbox.** On a real GPU (verified on an RTX A6000 with driver 570, kernel 6.8), CUDA
+  initialisation fails inside the sandbox with error 304. Landlock blocks the driver's read of
+  `/proc/sys/vm/mmap_min_addr`, and seccomp blocks the `AF_UNIX` socket the driver creates (an MPS
+  probe and an abstract `cuda-uvmfd-*` socket). The production config therefore uses `"device": "cpu"`.
+  The proposed fix is to allow that single file and `AF_UNIX`-only sockets, with `connect` forced to
+  ENOENT and send calls still blocked. It is pending a security review.
