@@ -7,6 +7,8 @@ in the module namespace so these tests exercise only the module's own logic.
 from __future__ import annotations
 
 import json
+import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -150,9 +152,10 @@ def harness(monkeypatch, tmp_path):
         h.package_args = (url, cache_dir)
         return h.package
 
-    def fake_resolve_model_dir(repo_id, revision="main"):
+    def fake_resolve_model_dir(repo_id, revision="main", *, allow_local=False):
         h.calls["model_dir"] += 1
         h.model_args = (repo_id, revision)
+        h.allow_local = allow_local
         return tmp_path / "model"
 
     def fake_load(model_dir, adapter_filename, **kwargs):
@@ -413,7 +416,22 @@ def test_passes_config_and_inputs_through(harness):
     assert kwargs["memory_limit_bytes"] == 3 * 1024**3
     assert kwargs["load_timeout_seconds"] == 11
     assert kwargs["detect_timeout_seconds"] == 7
-    assert kwargs["cpu_time_seconds"] == 99
+    # The configured CPU budget is a floor, scaled to the run's worst-case wall
+    # time on every core so RLIMIT_CPU can never fire before a wall-time limit.
+    planned = len(harness.package.manifest.clips)
+    worst_wall = 11 + planned * (module.config.detect_retries + 1) * 7
+    assert kwargs["cpu_time_seconds"] == max(99, math.ceil(worst_wall * (os.cpu_count() or 1)))
+    # Production never resolves a trainer reference to a host path, and the worker
+    # is denied the extracted package (hidden labels) and the validator's .env.
+    assert harness.allow_local is False
+    assert harness.package.root in kwargs["deny_read_paths"]
+    assert any(p.name == ".env" for p in kwargs["deny_read_paths"])
+
+
+def test_cpu_budget_never_drops_below_the_configured_floor(harness):
+    module = make_module(detector_cpu_time_seconds=10**9)
+    assert module._cpu_time_budget(3) == 10**9
+    assert make_module()._cpu_time_budget(500) >= 500 * 3 * 60
 
 
 def test_package_url_alias_is_used(harness):
@@ -553,7 +571,7 @@ def test_load_failure_invalidates_without_a_detector(harness, monkeypatch):
 
 
 def test_model_reference_error_invalidates(harness, monkeypatch):
-    def failing_resolve(repo_id, revision="main"):
+    def failing_resolve(repo_id, revision="main", *, allow_local=False):
         raise VideoSubmissionError("no such repo", "model_reference_invalid")
 
     monkeypatch.setattr(vi_module, "resolve_model_dir", failing_resolve)
@@ -615,3 +633,18 @@ def test_confidence_below_threshold_is_ignored_by_module_scoring(harness):
     assert metrics.localization_score == 0.0
     assert metrics.score == pytest.approx(0.75 + 0.2 * 0.0 + 0.05 * 0.5)
     assert make_module(confidence_threshold=0.1).validate(make_input()).score == pytest.approx(1.0)
+
+
+def test_local_validation_allows_a_local_submission_dir(harness, monkeypatch):
+    from validator.modules.video_inconsistency import local_validate
+
+    seen = {}
+
+    def fake_validate(self, data, **kwargs):
+        seen["allow_local"] = self.config.allow_local_model_dir
+        return make_module()._invalid_metrics("stub")
+
+    monkeypatch.setattr(vi_module.VideoInconsistencyValidationModule, "validate", fake_validate)
+    local_validate.run_local_validation("./my_submission", validation_data_url="/tmp/pkg.zip")
+    assert seen["allow_local"] is True
+    assert VideoInconsistencyConfig().allow_local_model_dir is False

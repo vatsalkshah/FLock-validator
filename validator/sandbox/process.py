@@ -45,6 +45,7 @@ class SandboxProcess:
         memory_limit_bytes: int,
         temp_prefix: str = "sandbox-worker-",
         unsafe_local_env_var: str | None = None,
+        deny_read_paths: Sequence[Path] = (),
     ) -> None:
         # Set first so __del__/close are safe if construction fails part-way.
         self._closed = True
@@ -52,7 +53,11 @@ class SandboxProcess:
         self._process: subprocess.Popen[bytes] | None = None
         self._temp_dir = Path(tempfile.mkdtemp(prefix=temp_prefix))
         try:
-            command = wrap_command(argv, unsafe_local_env_var=unsafe_local_env_var)
+            command = wrap_command(
+                argv,
+                unsafe_local_env_var=unsafe_local_env_var,
+                deny_read_paths=deny_read_paths,
+            )
             self._process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -126,8 +131,16 @@ class SandboxProcess:
             _kill_process_group(process)
             self._raise_if_memory_exceeded(exc)
             raise SandboxError("Sandbox worker exited unexpectedly", "crashed") from exc
-        except (MessageTooLargeError, UnicodeDecodeError, ValueError, OSError) as exc:
-            # ValueError covers JSONDecodeError and non-object payloads.
+        except (
+            MessageTooLargeError,
+            UnicodeDecodeError,
+            ValueError,
+            OSError,
+            RecursionError,
+        ) as exc:
+            # ValueError covers JSONDecodeError and non-object payloads;
+            # RecursionError a hostile, deeply nested JSON reply (json.loads raises
+            # it, and it must not escape as an infrastructure error).
             _kill_process_group(process)
             self._raise_if_memory_exceeded(exc)
             raise SandboxError(
@@ -208,9 +221,17 @@ class SandboxProcess:
 
 
 def wrap_command(
-    argv: Sequence[str], *, unsafe_local_env_var: str | None = None
+    argv: Sequence[str],
+    *,
+    unsafe_local_env_var: str | None = None,
+    deny_read_paths: Sequence[Path] = (),
 ) -> list[str]:
     """Return the command that starts ``argv`` inside this platform's sandbox.
+
+    ``deny_read_paths`` (e.g. the extracted validation package with its hidden
+    labels, or a credentials file) are made unreadable on macOS, where the
+    profile otherwise allows all file reads. On Linux, Landlock already grants
+    the worker only an allowlist of paths.
 
     Raises ``SandboxUnavailableError`` when the host cannot sandbox at all.
     """
@@ -230,11 +251,21 @@ def wrap_command(
             logger.debug("Running sandbox worker without sandbox-exec (test/local mode)")
             return base
         if shutil.which("sandbox-exec"):
-            profile = "(version 1)(allow default)(deny network*)"
-            return ["sandbox-exec", "-p", profile, *base]
+            return ["sandbox-exec", "-p", darwin_profile(deny_read_paths), *base]
     raise SandboxUnavailableError(
         f"No supported network sandbox is available on {system or 'this platform'}"
     )
+
+
+def darwin_profile(deny_read_paths: Sequence[Path] = ()) -> str:
+    """sandbox-exec profile: no network, and no reads of ``deny_read_paths``."""
+    rules = ["(version 1)", "(allow default)", "(deny network*)"]
+    for path in deny_read_paths:
+        # sandbox-exec matches real paths (/var -> /private/var on macOS).
+        real = os.path.realpath(path)
+        literal = '"' + real.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        rules.append(f"(deny file-read* (subpath {literal}))")
+    return "".join(rules)
 
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:

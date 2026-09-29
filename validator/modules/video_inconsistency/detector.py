@@ -14,7 +14,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 from huggingface_hub import errors as hf_errors
@@ -75,10 +75,20 @@ _DETECT_SANDBOX_MODES = {
 }
 
 
-def resolve_model_dir(repo_id_or_path: str, revision: str = "main") -> Path:
-    candidate = Path(repo_id_or_path).expanduser()
-    if candidate.exists():
-        return candidate.resolve()
+def resolve_model_dir(
+    repo_id_or_path: str, revision: str = "main", *, allow_local: bool = False
+) -> Path:
+    """Download the submitted Hugging Face repo (or use a local dir when allowed).
+
+    ``allow_local`` is only for local validation. In production the reference
+    comes from the trainer, and treating it as a host path would let a submission
+    point the sandbox (which is granted read access to the model directory) at
+    arbitrary validator files such as the extracted validation package.
+    """
+    if allow_local:
+        candidate = Path(repo_id_or_path).expanduser()
+        if candidate.exists():
+            return candidate.resolve()
 
     token = os.getenv("HF_TOKEN")
     try:
@@ -183,6 +193,7 @@ def load_detector_from_adapter(
     detect_timeout_seconds: float = DEFAULT_DETECTOR_DETECT_TIMEOUT_SECONDS,
     memory_limit_bytes: int = DEFAULT_DETECTOR_MEMORY_LIMIT_BYTES,
     cpu_time_seconds: int = DEFAULT_DETECTOR_CPU_TIME_SECONDS,
+    deny_read_paths: Sequence[Path] = (),
 ) -> "IsolatedDetector":
     model_root = model_dir.resolve()
     _check_adapter_path(model_root, adapter_filename)
@@ -195,6 +206,7 @@ def load_detector_from_adapter(
         detect_timeout_seconds=detect_timeout_seconds,
         memory_limit_bytes=memory_limit_bytes,
         cpu_time_seconds=cpu_time_seconds,
+        deny_read_paths=deny_read_paths,
     )
 
 
@@ -227,6 +239,7 @@ class IsolatedDetector:
         detect_timeout_seconds: float,
         memory_limit_bytes: int,
         cpu_time_seconds: int,
+        deny_read_paths: Sequence[Path] = (),
     ) -> "IsolatedDetector":
         if (
             min(
@@ -262,6 +275,7 @@ class IsolatedDetector:
                 memory_limit_bytes=memory_limit_bytes,
                 temp_prefix="video-detector-worker-",
                 unsafe_local_env_var=UNSAFE_LOCAL_ENV_VAR,
+                deny_read_paths=deny_read_paths,
             )
         except SandboxUnavailableError as exc:
             shutil.rmtree(input_dir, ignore_errors=True)

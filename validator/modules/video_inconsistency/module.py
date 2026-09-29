@@ -14,8 +14,11 @@ propagates so the runner can retry or re-queue instead of zeroing a trainer.
 from __future__ import annotations
 
 import json
+import math
+import os
 import time
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -56,6 +59,8 @@ from validator.modules.video_inconsistency.video_io import decode_video
 WORST_POSSIBLE_LOSS = 1.0
 PROGRESS_LOG_EVERY = 10
 _URL_FIELDS = ("validation_data_url", "validation_zip_url", "validation_set_url")
+# Repository root; its .env holds validator credentials.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _decoy_counts(clips: list[ClipSpec]) -> dict[str, int]:
@@ -81,7 +86,13 @@ class VideoInconsistencyConfig(BaseConfig):
     # Authoritative model-size ceiling, enforced at runtime by the sandbox (CUDA
     # allocator fraction + host RSS monitor), however the weights are represented.
     detector_memory_limit_gb: int = Field(default=18, ge=1)
+    # Floor for the worker's RLIMIT_CPU. The effective budget is scaled up to cover
+    # the run's worst-case wall time on every core (see _cpu_time_budget), so it is
+    # only a backstop and never kills a detector that is within its wall-time limits.
     detector_cpu_time_seconds: int = Field(default=7200, ge=1)
+    # Local validation only: accept a local directory as the submission. Production
+    # references come from trainers and must never resolve to host paths.
+    allow_local_model_dir: bool = False
     # Extra attempts (after the first) for a clip whose detect() raised or
     # returned malformed output while the sandbox is still healthy.
     detect_retries: int = Field(default=2, ge=0)
@@ -192,7 +203,11 @@ class VideoInconsistencyValidationModule(BaseValidationModule):
                     f"match config suite_version {self.config.suite_version!r}"
                 )
 
-            model_dir = resolve_model_dir(data.hg_repo_id, data.revision)
+            model_dir = resolve_model_dir(
+                data.hg_repo_id,
+                data.revision,
+                allow_local=self.config.allow_local_model_dir,
+            )
             detector = load_detector_from_adapter(
                 model_dir,
                 data.adapter_filename,
@@ -201,7 +216,10 @@ class VideoInconsistencyValidationModule(BaseValidationModule):
                 load_timeout_seconds=self.config.detector_load_timeout_seconds,
                 detect_timeout_seconds=self.config.detect_timeout_seconds,
                 memory_limit_bytes=self.config.detector_memory_limit_gb * 1024**3,
-                cpu_time_seconds=self.config.detector_cpu_time_seconds,
+                cpu_time_seconds=self._cpu_time_budget(len(self._planned_clips(package))),
+                # Hidden labels and validator credentials. Landlock already keeps
+                # them out of reach on Linux; this also covers macOS hosts.
+                deny_read_paths=[package.root, _REPO_ROOT / ".env"],
             )
             try:
                 parameter_count = getattr(detector, "parameter_count", None)
@@ -233,9 +251,7 @@ class VideoInconsistencyValidationModule(BaseValidationModule):
         detector: Any,
         parameter_count: int | None,
     ) -> VideoInconsistencyMetrics:
-        clips = list(package.manifest.clips)
-        if self.config.max_clips is not None:
-            clips = clips[: self.config.max_clips]
+        clips = self._planned_clips(package)
         planned = len(clips)
         failure_modes: Counter[str] = Counter()
         evaluated: list[ClipSpec] = []
@@ -291,6 +307,28 @@ class VideoInconsistencyValidationModule(BaseValidationModule):
             parameter_count=parameter_count,
             diagnostics=diagnostics,
         )
+
+    def _planned_clips(self, package: ResolvedVideoPackage) -> list[ClipSpec]:
+        clips = list(package.manifest.clips)
+        if self.config.max_clips is not None:
+            clips = clips[: self.config.max_clips]
+        return clips
+
+    def _cpu_time_budget(self, planned_clips: int) -> int:
+        """RLIMIT_CPU for the worker: a backstop, never tighter than the wall limits.
+
+        RLIMIT_CPU sums CPU time over every thread, so a multi-threaded detector on
+        a many-core host burns it many times faster than wall time. Scale it to the
+        run's worst-case wall time (load plus every attempt on every clip) on all
+        cores, with the configured value as a floor.
+        """
+        attempts = self.config.detect_retries + 1
+        worst_wall_seconds = (
+            self.config.detector_load_timeout_seconds
+            + planned_clips * attempts * self.config.detect_timeout_seconds
+        )
+        scaled = math.ceil(worst_wall_seconds * (os.cpu_count() or 1))
+        return max(self.config.detector_cpu_time_seconds, scaled)
 
     def _decode_clip(self, package: ResolvedVideoPackage, clip: ClipSpec) -> Any:
         """Decode on the host. A mismatch with the manifest is a package (infra) bug."""

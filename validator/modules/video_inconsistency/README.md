@@ -149,14 +149,15 @@ Trainer Python never executes in the validator process. A worker process imports
 - **No network.** Network syscalls are denied (seccomp on Linux, `sandbox-exec` on macOS); the worker environment is offline (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`). Nothing can be downloaded at runtime. On Linux the only socket the worker may create is a local `AF_UNIX` one, because the CUDA driver needs it during initialisation. `connect` always fails with "no such file" (which is what CUDA sees when no MPS daemon runs), and `sendto`, `sendmsg`, `accept`, `listen` and `socketpair` stay blocked, so that socket cannot reach host daemons or anything else.
 - **Clean environment.** No `FLOCK_API_KEY`, `HF_TOKEN`, cloud credentials, proxy settings or validator home directory are visible.
 - **Filesystem restriction.** On Linux, Landlock confines the worker to read-only access to the model directory and system libraries, plus a private scratch directory; the validator checkout is not readable.
-- **Resource limits.** CPU time, open files and output size are rlimited; every `load` and `detect` call has a wall-time limit; and the worker is held to the memory ceiling described below. The worker is killed as a process group on timeout, protocol failure or memory breach.
+- **Resource limits.** CPU time, open files (1024) and file size (4 GiB per file) are rlimited. Every `load` and `detect` call has a wall-time limit, and the worker is held to the memory ceiling described below. The worker is killed as a process group on timeout, protocol failure or memory breach.
+- **Submissions always come from the Hub.** In production `hg_repo_id` is always resolved through Hugging Face, never as a path on the validator host. Only `--local-validation` accepts a local directory.
 - **Frames are staged read-only.** The host decodes each clip and hands it over as a `.npy` file and a neutrally named `.mp4` in a host-owned directory the worker can only read.
 - **No labels or clip ids reach the sandbox.** The worker sees pixels, fps and the canonical type list, nothing else: no clip id, package filename, difficulty, source tag or label.
 - **Memory ceiling, not parameter count.** `detector_memory_limit_gb` (default **18 GiB**) bounds GPU VRAM via the CUDA allocator fraction and host RAM via a runtime RSS monitor. Parameter count is reported as telemetry only.
 
 Residual limitations, for operators:
 
-- On macOS, `sandbox-exec` denies the network only; the Landlock filesystem and seccomp guarantees are Linux-only. Use Linux for production.
+- On macOS, `sandbox-exec` denies the network and reads of the extracted validation package and the validator's `.env`. Every other file stays readable, and the Landlock and seccomp guarantees are Linux-only. Use Linux for production.
 - The VRAM cap covers `torch` allocations; raw non-`torch` CUDA allocations are not covered. For a hard, kernel-enforced ceiling run the validator in a container with a cgroup memory limit.
 - If the host can provide no sandbox at all, evaluation raises an infrastructure error (the assignment is retried/re-queued); it never scores the trainer 0 for it.
 
@@ -221,7 +222,8 @@ Defaults live in [`configs/video_inconsistency.json`](../../../configs/video_inc
 | `detector_load_timeout_seconds` | 600 | Wall-time limit for adapter import + `load_detector` |
 | `detect_timeout_seconds` | 60 | Wall-time limit per `detect` call |
 | `detector_memory_limit_gb` | 18 | Sandbox memory ceiling (VRAM + RAM) |
-| `detector_cpu_time_seconds` | 7200 | Total CPU-time rlimit of the worker |
+| `detector_cpu_time_seconds` | 7200 | Floor for the worker's CPU-time rlimit. The effective limit is scaled to the run's worst-case wall time (load plus every attempt on every clip) times the host's cores, so it is only a backstop and never fires before a wall-time limit. |
+| `allow_local_model_dir` | `false` | Accept a local directory as the submission. `--local-validation` turns it on; keep it off in production |
 | `detect_retries` | 2 | Extra attempts for a non-fatal per-clip failure |
 | `max_failed_clip_fraction` | 0.25 | Invalid once more than this share of clips failed |
 | `tiou_thresholds` | 0.3, 0.4, 0.5, 0.6, 0.7 | tIoU thresholds averaged by mAP |

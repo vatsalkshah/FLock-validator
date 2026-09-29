@@ -1130,6 +1130,76 @@ def test_sandbox_process_round_trip_and_idempotent_close(tmp_path: Path):
     assert excinfo.value.failure_mode == "crashed"
 
 
+def test_sandbox_process_deeply_nested_reply_is_a_protocol_error(tmp_path: Path):
+    # json.loads raises RecursionError (not ValueError) on deep nesting; it must be
+    # classified as the worker's protocol violation, never escape as an infra error.
+    argv = _fake_worker(
+        tmp_path,
+        """
+        payload = b"[" * 200000 + b"]" * 200000
+        out.write(HEADER.pack(len(payload)) + payload)
+        import time; time.sleep(30)
+        """,
+    )
+    with SandboxProcess(argv, memory_limit_bytes=16 * GIB) as sandbox:
+        with pytest.raises(SandboxError) as excinfo:
+            sandbox.receive(20, "my_timeout")
+    assert excinfo.value.failure_mode == "protocol_error"
+    assert excinfo.value.fatal is True
+
+
+def test_resolve_model_dir_refuses_host_paths_unless_local_is_allowed(tmp_path: Path):
+    local = tmp_path / "submission"
+    local.mkdir()
+    assert detector_module.resolve_model_dir(str(local), allow_local=True) == local.resolve()
+    # In production a trainer's reference is always a Hub id: an existing host path
+    # is not a valid repo id and is rejected without touching the filesystem.
+    with pytest.raises(VideoSubmissionError) as excinfo:
+        detector_module.resolve_model_dir(str(local))
+    assert excinfo.value.failure_mode == "model_reference_invalid"
+
+
+def test_darwin_profile_denies_reading_the_given_paths(tmp_path: Path):
+    from validator.sandbox.process import darwin_profile
+
+    labels = tmp_path / 'pkg "quoted"'
+    profile = darwin_profile([labels])
+    assert profile.startswith("(version 1)(allow default)(deny network*)")
+    real = os.path.realpath(labels).replace('"', '\\"')
+    assert f'(deny file-read* (subpath "{real}"))' in profile
+    assert darwin_profile() == "(version 1)(allow default)(deny network*)"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec behaviour")
+def test_sandbox_exec_profile_blocks_reading_denied_paths(tmp_path: Path):
+    import shutil
+
+    from validator.sandbox.process import darwin_profile
+
+    if not shutil.which("sandbox-exec"):
+        pytest.skip("sandbox-exec not available")
+    secret_dir = tmp_path / "package"
+    secret_dir.mkdir()
+    (secret_dir / "manifest.json").write_text("hidden labels")
+    allowed = tmp_path / "allowed.txt"
+    allowed.write_text("ok")
+    code = (
+        "import sys\n"
+        f"print(open({str(allowed)!r}).read())\n"
+        f"try:\n    open({str(secret_dir / 'manifest.json')!r}).read()\n    print('LEAK')\n"
+        "except OSError:\n    print('DENIED')\n"
+    )
+    completed = subprocess.run(
+        ["sandbox-exec", "-p", darwin_profile([secret_dir]), sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if completed.returncode != 0 and "sandbox_apply" in completed.stderr:
+        pytest.skip("this host forbids nesting sandbox-exec")
+    assert completed.stdout.split() == ["ok", "DENIED"]
+
+
 def test_sandbox_process_timeout_uses_caller_mode(tmp_path: Path):
     argv = _fake_worker(tmp_path, "import time; time.sleep(60)\n")
     with SandboxProcess(argv, memory_limit_bytes=16 * GIB) as sandbox:

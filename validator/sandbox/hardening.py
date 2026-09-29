@@ -78,13 +78,22 @@ def protect_parent_secrets() -> None:
         ) from exc
 
 
+# Per-file size cap for anything the worker writes (its TMPDIR/HOME only). Large
+# enough for CUDA JIT, Triton and torch.compile caches or an unpacked weights
+# shard, which a smaller cap would kill with SIGXFSZ mid-load.
+_MAX_FILE_BYTES = 4 * 1024**3
+# Sharded weights, CUDA device handles, video decoders and the pinned /proc
+# descriptors all count against this; 64 broke large models with EMFILE.
+_MAX_OPEN_FILES = 1024
+
+
 def apply_resource_limits(
     memory_limit_bytes: int, cpu_time_seconds: int, device: str
 ) -> None:
     limits = [
         (resource.RLIMIT_CPU, cpu_time_seconds),
-        (resource.RLIMIT_FSIZE, 64 * 1024**2),
-        (resource.RLIMIT_NOFILE, 64),
+        (resource.RLIMIT_FSIZE, _MAX_FILE_BYTES),
+        (resource.RLIMIT_NOFILE, _MAX_OPEN_FILES),
     ]
     # RLIMIT_AS bounds *virtual* address space. A CUDA context reserves far more
     # VA than it uses, so a model-sized RLIMIT_AS would break GPU init — there the

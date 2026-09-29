@@ -36,7 +36,9 @@ def run_local_validation(
         config_model=VideoInconsistencyConfig,
         config_dir=config_dir,
     )
-    config_updates: dict[str, Any] = {}
+    # Local validation may point at a submission folder on disk; production
+    # references always resolve through the Hugging Face Hub.
+    config_updates: dict[str, Any] = {"allow_local_model_dir": True}
     if max_clips is not None:
         config_updates["max_clips"] = max_clips
     if device is not None:
