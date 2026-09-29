@@ -146,7 +146,7 @@ def load_detector(model_dir: str, device: str, dtype: str) -> Detector:
 
 Trainer Python never executes in the validator process. A worker process imports the adapter, loads the model and serves `detect` calls over a bounded JSON protocol (pickle is never accepted). Guarantees:
 
-- **No network.** Network syscalls are denied (seccomp on Linux, `sandbox-exec` on macOS); the worker environment is offline (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`). Nothing can be downloaded at runtime.
+- **No network.** Network syscalls are denied (seccomp on Linux, `sandbox-exec` on macOS); the worker environment is offline (`HF_HUB_OFFLINE`, `TRANSFORMERS_OFFLINE`). Nothing can be downloaded at runtime. On Linux the only socket the worker may create is a local `AF_UNIX` one, because the CUDA driver needs it during initialisation. `connect` always fails with "no such file" (which is what CUDA sees when no MPS daemon runs), and `sendto`, `sendmsg`, `accept`, `listen` and `socketpair` stay blocked, so that socket cannot reach host daemons or anything else.
 - **Clean environment.** No `FLOCK_API_KEY`, `HF_TOKEN`, cloud credentials, proxy settings or validator home directory are visible.
 - **Filesystem restriction.** On Linux, Landlock confines the worker to read-only access to the model directory and system libraries, plus a private scratch directory; the validator checkout is not readable.
 - **Resource limits.** CPU time, open files and output size are rlimited; every `load` and `detect` call has a wall-time limit; and the worker is held to the memory ceiling described below. The worker is killed as a process group on timeout, protocol failure or memory breach.
@@ -215,7 +215,7 @@ Defaults live in [`configs/video_inconsistency.json`](../../../configs/video_inc
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `suite_version` | `video_inconsistency_v2` | Must match the package manifest, else the assignment is re-queued |
-| `device` / `torch_dtype` | `cpu` / `float32` | Passed to `load_detector`. CPU until CUDA initialisation inside the sandbox is fixed (see Known limitations) |
+| `device` / `torch_dtype` | `cuda` / `bfloat16` | Passed to `load_detector` |
 | `package_cache_dir` | `.cache/video_inconsistency/package_cache` | Extracted package cache |
 | `max_clips` | `null` | Evaluate only the first N clips (smoke tests) |
 | `detector_load_timeout_seconds` | 600 | Wall-time limit for adapter import + `load_detector` |
@@ -266,7 +266,7 @@ python run.py video_inconsistency \
   --hf-token "$HF_TOKEN"
 ```
 
-Add `--max-clips 5` for a quick smoke test, `--adapter-filename other.py` for a non-default adapter, and `--output-json out.json` to save the metrics. `--hf-model-repo` also accepts a local directory. `--device` overrides the config (`cpu` by default; see [Known limitations](#known-limitations) before using `cuda`).
+Add `--max-clips 5` for a quick smoke test, `--adapter-filename other.py` for a non-default adapter, and `--output-json out.json` to save the metrics. `--hf-model-repo` also accepts a local directory. `--device cpu` overrides the config's `cuda` on machines without a GPU.
 
 ### Building validation packages
 
@@ -373,11 +373,19 @@ No. See [Sandbox](#sandbox).
 
 Check `per_type_ap` and `ap_by_tiou` first: a high-confidence false alarm ranked above a correct finding lowers that type's AP, duplicate predictions of one issue are false positives, any prediction of a type that has no ground truth anywhere gives that type AP 0, sloppy boundaries only score at the lower tIoU thresholds, and spatial issues need a bbox with IoU >= `bbox_iou_threshold` to count at all. Decoys (see the table at the top of this page) are the usual source of false alarms. `diagnostics.per_type_counts` holds the thresholded TP / FP / FN counts.
 
-## Known limitations
+### CUDA fails inside the sandbox with error 304
 
-- **GPU inside the sandbox.** On a real GPU (verified on an RTX A6000 with driver 570, kernel 6.8), CUDA
-  initialisation fails inside the sandbox with error 304. Landlock blocks the driver's read of
-  `/proc/sys/vm/mmap_min_addr`, and seccomp blocks the `AF_UNIX` socket the driver creates (an MPS
-  probe and an abstract `cuda-uvmfd-*` socket). The production config therefore uses `"device": "cpu"`.
-  The proposed fix is to allow that single file and `AF_UNIX`-only sockets, with `connect` forced to
-  ENOENT and send calls still blocked. It is pending a security review.
+During initialisation the CUDA driver needs four things the sandbox would otherwise deny:
+- it reads `/proc/sys/vm/mmap_min_addr`;
+- it reads the worker's own `/proc/self/fd`;
+- it names its threads through `/proc/self/task/<tid>/comm`;
+- it creates a local `AF_UNIX` socket to probe for an MPS daemon, and binds and listens on an
+  abstract `cuda-uvmfd-*` socket.
+
+The sandbox allows exactly these. Only the worker's own `/proc/<pid>` entries are granted.
+Because procfs recreates pid inodes, those two rules are attached to descriptors held open for the
+worker's lifetime. `connect` is forced to fail with ENOENT, and `accept`, `sendto` and `sendmsg`
+stay blocked. This was verified on an RTX A6000 (driver 570) and an L40 (driver 580). If you
+change `validator/sandbox/hardening.py`, re-run the Linux GPU test
+(`test_worker_runs_cuda_inside_the_sandbox_within_the_memory_cap`) on a GPU host. It is skipped
+elsewhere.

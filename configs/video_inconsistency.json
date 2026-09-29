@@ -1,7 +1,7 @@
 {
   "suite_version": "video_inconsistency_v2",
-  "device": "cpu",
-  "torch_dtype": "float32",
+  "device": "cuda",
+  "torch_dtype": "bfloat16",
   "package_cache_dir": ".cache/video_inconsistency/package_cache",
   "detector_load_timeout_seconds": 600,
   "detect_timeout_seconds": 60,

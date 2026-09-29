@@ -633,10 +633,100 @@ def test_parameter_count_is_none_without_torch_modules(tmp_path: Path):
         assert detector.parameter_count is None
 
 
+def _cuda_available() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available())
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not _cuda_available(), reason="needs Linux with a CUDA GPU"
+)
+def test_worker_runs_cuda_inside_the_sandbox_within_the_memory_cap(tmp_path: Path):
+    model_dir = _write_adapter(
+        tmp_path / "model",
+        """
+        import torch
+
+        class Detector:
+            def __init__(self, device):
+                self.device = device
+                self.net = torch.nn.Linear(64, 64).to(device)
+
+            def detect(self, video):
+                if video["num_frames"] > 1000:
+                    torch.empty(int(8 * 1024**3), dtype=torch.uint8, device=self.device)
+                x = torch.from_numpy(video["frames"][:4].copy()).to(self.device).float()
+                return {"issues": [], "device": torch.cuda.get_device_name(0),
+                        "sum": float(x.mean())}
+
+        def load_detector(model_dir, device, dtype):
+            return Detector(device)
+        """,
+    )
+    detector = load_detector_from_adapter(
+        model_dir,
+        "flock_video_adapter.py",
+        device="cuda",
+        torch_dtype="bfloat16",
+        load_timeout_seconds=300,
+        detect_timeout_seconds=120,
+        memory_limit_bytes=4 * 1024**3,
+        cpu_time_seconds=600,
+    )
+    with detector:
+        result = detector.detect(frames=_frames(), video_path=_video_file(tmp_path), fps=15.0)
+        assert result["device"]
+        with pytest.raises(VideoSubmissionError):
+            # 8 GiB on a 4 GiB cap: the CUDA allocator fraction refuses it.
+            detector.detect(frames=_frames(1001), video_path=_video_file(tmp_path), fps=15.0)
+
+    oversize = _write_adapter(
+        tmp_path / "oversize",
+        """
+        import torch
+
+        class Detector:
+            def detect(self, video):
+                return []
+
+        def load_detector(model_dir, device, dtype):
+            d = Detector()
+            d.big = torch.empty(int(8 * 1024**3), dtype=torch.uint8, device=device)
+            return d
+        """,
+    )
+    with pytest.raises(VideoSubmissionError) as excinfo:
+        load_detector_from_adapter(
+            oversize,
+            "flock_video_adapter.py",
+            device="cuda",
+            torch_dtype="bfloat16",
+            load_timeout_seconds=300,
+            detect_timeout_seconds=120,
+            memory_limit_bytes=4 * 1024**3,
+            cpu_time_seconds=600,
+        )
+    assert excinfo.value.failure_mode in {"model_load_failed", "detector_memory_exceeded"}
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux Landlock/seccomp behaviour")
 def test_worker_denies_network_filesystem_and_process_escape(tmp_path: Path):
     secret = tmp_path / "validator-secret.txt"
     secret.write_text("must-not-be-readable")
+    # A live host daemon socket (stands in for e.g. /var/run/docker.sock). Landlock
+    # does not mediate UNIX connect, so seccomp must refuse it.
+    import socket as host_socket
+
+    daemon_path = tmp_path / "host-daemon.sock"
+    daemon = host_socket.socket(host_socket.AF_UNIX, host_socket.SOCK_STREAM)
+    daemon.bind(str(daemon_path))
+    daemon.listen(1)
+    abstract = host_socket.socket(host_socket.AF_UNIX, host_socket.SOCK_STREAM)
+    abstract.bind("\0flock-test-abstract-daemon")
+    abstract.listen(1)
     model_path = tmp_path / "model"
     model_dir = _write_adapter(
         model_path,
@@ -655,7 +745,23 @@ def test_worker_denies_network_filesystem_and_process_escape(tmp_path: Path):
                         denied[name] = True
                     else:
                         denied[name] = False
+                def unix_connect(address):
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.connect(address)
+                def unix_sendto():
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+                    s.sendto(b"x", {str(daemon_path)!r})
                 attempt("socket", socket.socket)
+                attempt("socket_inet6", lambda: socket.socket(socket.AF_INET6, socket.SOCK_STREAM))
+                attempt("socket_netlink", lambda: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW))
+                attempt("unix_connect_path", lambda: unix_connect({str(daemon_path)!r}))
+                attempt("unix_connect_abstract", lambda: unix_connect("\\0flock-test-abstract-daemon"))
+                attempt("unix_sendto", unix_sendto)
+                attempt("socketpair", socket.socketpair)
+                # allowed: a bare local socket (the CUDA driver creates one)
+                socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET).close()
+                # only the worker's own /proc entries are granted, never another process's
+                attempt("parent_proc", lambda: open("/proc/%d/cmdline" % os.getppid()).read())
                 attempt("secret", lambda: open({str(secret)!r}).read())
                 attempt("exec", lambda: subprocess.run(["/bin/true"], check=True))
                 attempt("repo", lambda: os.listdir({str(REPO_ROOT)!r}))
@@ -678,10 +784,21 @@ def test_worker_denies_network_filesystem_and_process_escape(tmp_path: Path):
         detector = _load(model_dir)
     except RecoverableException as exc:
         pytest.skip(f"host cannot provide Landlock/seccomp: {exc}")
-    with detector:
-        outcome = _detect(detector, tmp_path)
+    try:
+        with detector:
+            outcome = _detect(detector, tmp_path)
+    finally:
+        daemon.close()
+        abstract.close()
     assert outcome == {
         "socket": True,
+        "socket_inet6": True,
+        "socket_netlink": True,
+        "unix_connect_path": True,
+        "unix_connect_abstract": True,
+        "unix_sendto": True,
+        "socketpair": True,
+        "parent_proc": True,
         "secret": True,
         "exec": True,
         "repo": True,

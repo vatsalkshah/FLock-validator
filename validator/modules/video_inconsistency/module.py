@@ -71,11 +71,8 @@ def _decoy_counts(clips: list[ClipSpec]) -> dict[str, int]:
 
 class VideoInconsistencyConfig(BaseConfig):
     suite_version: str = SUITE_VERSION
-    # CPU until CUDA initialisation inside the sandbox is fixed: on a real GPU the
-    # driver's AF_UNIX socket and /proc/sys/vm/mmap_min_addr read are blocked
-    # (error 304). Switch to "cuda" together with that sandbox change.
-    device: str = "cpu"
-    torch_dtype: str = "float32"
+    device: str = "cuda"
+    torch_dtype: str = "bfloat16"
     package_cache_dir: str = DEFAULT_PACKAGE_CACHE_DIR
     max_clips: int | None = Field(default=None, ge=1)
 
