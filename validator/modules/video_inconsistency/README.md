@@ -4,7 +4,19 @@ Validates video-forensics detectors submitted to [FLock AI Arena](https://flock.
 
 Suite version: **`video_inconsistency_v2`** (v1 packages are not comparable). v2 adds an `expert` difficulty tier, **decoys**, post-edit degradation (per-clip compression quality), and rank-based **mean average precision** scoring.
 
-**Decoys** are hard negatives: legitimate, unlabelled events that look abrupt but are not inconsistencies. They are placed in edited and clean clips alike and are never scored; a detector that fires on them pays in precision. The decoy types are legitimate scene cuts, gradual exposure drift, gradual white-balance drift, smooth zooms, objects entering the frame, objects leaving the frame, objects that stop moving, and the camera coming to a stop. They are recorded in the package manifest (`ClipSpec.decoys`) for analysis and for training data, and their counts are reported in `diagnostics.decoy_counts`; they never reach the sandbox.
+**Decoys** are hard negatives: legitimate, unlabelled events that look abrupt but are not inconsistencies. They are placed in edited and clean clips alike (about 1.1 per clip) and are never scored; a detector that fires on them pays in precision. There are 14 decoy types, most of them a deliberate look-alike of one issue type:
+
+| Decoy | Looks like |
+|-------|------------|
+| `scene_cut` (permanent switch to a new shot) | `spliced_footage`, `dropped_frames` |
+| `exposure_drift`, `auto_exposure_step`, `illumination_flicker` | `exposure_flicker`, `color_grade_jump` |
+| `white_balance_drift`, `auto_white_balance_step` | `color_grade_jump` |
+| `smooth_zoom`, `fast_zoom` (continuous, never snaps back) | `zoom_jump` |
+| `camera_direction_change`, `camera_speed_change` | `reversed_segment`, `dropped_frames` |
+| `camera_stops`, `object_stops` | `frozen_frames` |
+| `object_enters`, `object_exits` | `inserted_object` |
+
+Decoys never overlap the transition of the issue type they imitate, so every label stays unambiguous. They are recorded in the package manifest (`ClipSpec.decoys`) for analysis and for training data, and their counts are reported in `diagnostics.decoy_counts`; they never reach the sandbox.
 
 Trainers: start with the sample submission and data generator in [`trainer_sample/README.md`](trainer_sample/README.md).
 
@@ -113,15 +125,15 @@ class Detector:
     def detect(self, video: dict):
         frames = video["frames"]            # (T, H, W, 3) uint8
         fps = video["fps"]
-        # Toy heuristic: flag a frozen run when consecutive frames are identical.
+        # Toy heuristic: flag frames whose change from the previous frame is far
+        # below the clip's typical motion. Frames are never bit-identical (sensor
+        # noise and compression are applied after editing), so compare to the median.
         diffs = np.abs(frames[1:].astype(np.int16) - frames[:-1].astype(np.int16)).mean(axis=(1, 2, 3))
-        frozen = np.flatnonzero(diffs < 0.01)
-        if len(frozen) < 3:
-            return {"issues": []}
-        start, end = int(frozen[0]), int(frozen[-1]) + 2
+        still = np.flatnonzero(diffs < 0.35 * np.median(diffs))
         return {"issues": [{"type": "frozen_frames",
-                            "start_time": start / fps, "end_time": end / fps,
-                            "confidence": 0.8}]}
+                            "start_time": (int(i) + 1) / fps, "end_time": (int(i) + 2) / fps,
+                            "confidence": float(1.0 - diffs[i] / max(np.median(diffs), 1e-6))}
+                           for i in still[:10]]}
 
 
 def load_detector(model_dir: str, device: str, dtype: str) -> Detector:
@@ -182,7 +194,7 @@ These keep their v1 definitions (they use `tiou_threshold` = 0.3 and `confidence
 1. **Filtering and cap.** Per clip, keep predictions with `confidence >= confidence_threshold`, sort by confidence descending (stable). Only the top `max_predictions_per_clip` are matched; every prediction beyond the cap counts as a false positive of its type.
 2. **Greedy matching per type**, in confidence order: each prediction takes the unmatched ground truth of the same type with the highest tIoU; a true positive when tIoU `>= tiou_threshold`, else a false positive. Unmatched ground truth are false negatives.
 3. **F1.** Per-type precision, recall and F1 from the weighted counts (0 when undefined); types with neither ground truth nor predictions are excluded. `macro_f1` is the mean over included types; `micro_f1`, `precision`, `recall` come from pooled counts; all are 1.0 if no type is included.
-4. **Localization.** `localization_score = sum(weight * q over true positives) / sum(weight over all ground truth)` (1.0 if there is no ground truth and nothing was predicted, else 0), where `q = tIoU` for non-spatial types and `q = 0.5 * tIoU + 0.5 * bbox_IoU` for the spatial types (a missing predicted bbox gives `bbox_IoU = 0`).
+4. **Localization.** `localization_score = sum(weight * q over true positives) / (sum(weight over all ground truth) + sum(weight over confident false positives))` (1.0 when both sums are 0). Counting confident false positives in the denominator means firing confident junk to fish for matches is never free. Here `q = tIoU` for non-spatial types and `q = 0.5 * tIoU + 0.5 * bbox_IoU` for the spatial types (a missing predicted bbox gives `bbox_IoU = 0`).
 5. **Clip accuracy.** Balanced accuracy of "the clip contains an issue", predicting positive iff the clip has at least one prediction passing the confidence threshold: the mean of the true-positive rate over edited clips and the true-negative rate over clean clips (unweighted; the present class alone if the other is absent).
 
 ### Final score
@@ -233,7 +245,7 @@ export FLOCK_API_KEY="your_flock_api_key"
 export HF_TOKEN="your_huggingface_token"       # needed for private/gated model repos
 ```
 
-`run.py` creates the `flock-validation-video_inconsistency` conda environment (or a local venv) from [`environment.yml`](environment.yml) on first run.
+`run.py` creates the `flock-validation-video_inconsistency` conda environment from [`environment.yml`](environment.yml) on first run. It needs [miniconda](https://www.anaconda.com/docs/getting-started/miniconda/install). The environment also provides the libraries trainer code may import inside the sandbox: numpy, scipy, scikit-learn, pillow, opencv-python-headless, av, imageio-ffmpeg, torch, torchvision, transformers, timm, einops, safetensors, accelerate, peft, onnxruntime and huggingface-hub.
 
 ### Production run (FedLedger loop)
 
@@ -254,7 +266,7 @@ python run.py video_inconsistency \
   --hf-token "$HF_TOKEN"
 ```
 
-Add `--max-clips 5` for a quick smoke test, `--device cpu` on machines without a GPU, `--adapter-filename other.py` for a non-default adapter, and `--output-json out.json` to save the metrics. `--hf-model-repo` also accepts a local directory.
+Add `--max-clips 5` for a quick smoke test, `--adapter-filename other.py` for a non-default adapter, and `--output-json out.json` to save the metrics. `--hf-model-repo` also accepts a local directory. `--device` overrides the config (`cpu` by default; see [Known limitations](#known-limitations) before using `cuda`).
 
 ### Building validation packages
 
@@ -270,6 +282,54 @@ build_validation_package("private_package.zip", num_clips=200, seed=987654)  # k
 The same is available from the command line: `python -m validator.modules.video_inconsistency.build_package --output dev_package.zip --num-clips 60 --seed 1234` (see that module's docstring for real-footage options and the public-dev vs private-eval guidance).
 
 Package layout: `package.json`, `manifest.json` (clip specs and hidden labels) and `videos/<clip_id>.mp4`. Clip ids are hashes that carry no label information. Videos are encoded with a fixed GOP and scene-cut detection disabled, so keyframe placement never leaks where edits are.
+
+---
+
+## Datasets and difficulty
+
+### Datasets
+
+| Dataset | Where | Contents | Who uses it |
+|---------|-------|----------|-------------|
+| Trainer dataset | Hugging Face dataset repo `random-sequence/flock-video-inconsistency` | 8000 train + 1000 validation clips (HF `videofolder` layout, `metadata.jsonl` per split with issues and decoys), plus the 200-clip dev package | Trainers |
+| Dev package | `dev_package/video_inconsistency_dev_package.zip` in the trainer dataset (`build_package --num-clips 200 --seed 7`) | Standard validation package with labels | Trainers, for `--local-validation` |
+| Private evaluation package | Kept offline by the task owner; served to validators through `validation_data_url` | Validation package generated from a **secret** seed | Validators only |
+
+Build the trainer dataset with `python -m validator.modules.video_inconsistency.build_hf_dataset --out-dir <dir> --train-clips 8000 --validation-clips 1000 --dev-package-clips 200 --workers 8`. Add `--push-to-hub <repo_id>` to upload it; repos are created private unless `--public` is given, and the token is read only from `HF_TOKEN`. Train, validation and dev clips come from disjoint seed streams.
+
+Build a private evaluation package with `build_package` and a secret seed. Never publish the seed or the package: the generator is public, so anyone holding the seed can reproduce the labels. `misc/` is gitignored and is a convenient place to keep both.
+
+### Difficulty tiers
+
+Every issue has a magnitude range per tier (the defaults draw clips as easy 10% / medium 25% / hard 35% / expert 30%):
+
+| Issue | easy | medium | hard | expert |
+|-------|------|--------|------|--------|
+| `dropped_frames` | 0.4-0.8 s | 0.2-0.4 s | 1-2 frames | 1 frame |
+| `frozen_frames` | 0.6-1.0 s | 0.3-0.6 s | 2-3 frames | 2 frames |
+| `reversed_segment` | 0.8-1.2 s | 0.5-0.8 s | 0.3-0.5 s | 0.2-0.35 s |
+| `spliced_footage` | 0.5-0.8 s | 0.27-0.5 s | 2-4 frames, similar scene | 2-3 frames, similar scene |
+| `color_grade_jump` | gain 0.15-0.30 / hue 20-40 deg | 0.08-0.15 / 10-20 deg | 0.03-0.06 / 4-8 deg | 0.02-0.04 / 3-5 deg |
+| `exposure_flicker` | x1.4-1.8 / x0.5-0.7 | x1.2-1.4 / x0.7-0.82 | x1.08-1.12 / x0.88-0.92, 1 frame | x1.04-1.07 / x0.93-0.96, 1 frame |
+| `mirrored_segment` | 0.8-1.2 s | 0.4-0.8 s | 0.3-0.6 s | 0.3-0.5 s, mostly near-symmetric scenes |
+| `zoom_jump` | x1.2-1.4 | x1.1-1.2 | x1.03-1.08 | x1.02-1.05 |
+| `inserted_object` (size) | 10-15% | 6-10% | 4-6%, moves with the scene | 3-5%, moves with the scene |
+| `blurred_region` (size) | 15-25% | 10-15% | 6-10% | 5-8% |
+
+After editing, every clip gets sensor noise, optional blur or rescale, and a per-clip compression quality (CRF 18-28). Every labelled edit must pass a detectability check on the degraded frames, so nothing invisible is ever labelled.
+
+### Calibration
+
+Measured on the 200-clip dev package (seed 7), with each detector trained on generator data:
+
+| Detector | score | easy / medium / hard / expert |
+|----------|-------|-------------------------------|
+| No detections | 0.03 | 0.03 / 0.03 / 0.03 / 0.03 |
+| Rule-based heuristic (trainer sample, untrained) | 0.26 | 0.56 / 0.56 / 0.27 / 0.19 |
+| Temporal conv net, 2000 clips (trainer sample) | 0.57 | 0.64 / 0.72 / 0.61 / 0.50 |
+| Temporal conv net, 10000 clips, 0.9M params | 0.65 | 0.80 / 0.77 / 0.70 / 0.58 |
+
+The last detector gave the same score through the full sandboxed validator on Linux. The room above 0.65 lies in the spatial types (baseline AP 0), 2-frame freezes and short splices, and boundary precision. Re-run this ladder whenever the generator changes.
 
 ---
 
@@ -311,7 +371,7 @@ No. See [Sandbox](#sandbox).
 
 ### Why did a perfect-looking detector score below 1?
 
-Check `per_type_ap` and `ap_by_tiou` first: a high-confidence false alarm ranked above a correct finding lowers that type's AP, duplicate predictions of one issue are false positives, any prediction of a type that has no ground truth anywhere gives that type AP 0, sloppy boundaries only score at the lower tIoU thresholds, and spatial issues need a bbox with IoU >= `bbox_iou_threshold` to count at all. Decoys (legitimate cuts, exposure / white-balance drift, smooth zooms, objects entering / leaving / stopping, camera stops) are the usual source of false alarms. `diagnostics.per_type_counts` holds the thresholded TP / FP / FN counts.
+Check `per_type_ap` and `ap_by_tiou` first: a high-confidence false alarm ranked above a correct finding lowers that type's AP, duplicate predictions of one issue are false positives, any prediction of a type that has no ground truth anywhere gives that type AP 0, sloppy boundaries only score at the lower tIoU thresholds, and spatial issues need a bbox with IoU >= `bbox_iou_threshold` to count at all. Decoys (see the table at the top of this page) are the usual source of false alarms. `diagnostics.per_type_counts` holds the thresholded TP / FP / FN counts.
 
 ## Known limitations
 

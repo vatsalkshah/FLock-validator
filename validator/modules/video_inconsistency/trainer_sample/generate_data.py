@@ -33,7 +33,19 @@ from typing import Any
 
 # The scripts in this folder are run from anywhere; make the repo root importable so we can use
 # the validator's synthesiser / video I/O. (The *submission* never imports validator.*.)
-_REPO_ROOT = Path(__file__).resolve().parents[4]
+def _find_repo_root(start: Path) -> Path:
+    """The nearest ancestor holding ``validator/modules/video_inconsistency``.
+
+    Works both inside the FLock-validator checkout and in the trainer quickstart repo,
+    which vendors the needed validator modules at its root.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / "validator" / "modules" / "video_inconsistency" / "issue_types.py").is_file():
+            return candidate
+    return start.parents[3] if len(start.parents) > 3 else start
+
+
+_REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 

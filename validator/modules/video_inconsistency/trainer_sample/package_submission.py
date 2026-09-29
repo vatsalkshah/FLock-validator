@@ -18,8 +18,20 @@ import sys
 import tempfile
 from pathlib import Path
 
+def _find_repo_root(start: Path) -> Path:
+    """The nearest ancestor holding ``validator/modules/video_inconsistency``.
+
+    Works both inside the FLock-validator checkout and in the trainer quickstart repo,
+    which vendors the needed validator modules at its root.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / "validator" / "modules" / "video_inconsistency" / "issue_types.py").is_file():
+            return candidate
+    return start.parents[3] if len(start.parents) > 3 else start
+
+
 _HERE = Path(__file__).resolve().parent
-_REPO_ROOT = _HERE.parents[3]
+_REPO_ROOT = _find_repo_root(_HERE)
 
 ADAPTER_FILENAME = "flock_video_adapter.py"
 CODE_FILES = (ADAPTER_FILENAME, "vic_features.py", "vic_model.py", "vic_localize.py")
